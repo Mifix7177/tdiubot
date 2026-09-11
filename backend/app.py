@@ -31,7 +31,7 @@ from backend.menu_engine import (
     format_keyboard_grid,
     get_session
 )
-from backend.bot import bot, dp, notify_admins, publish_message_to_channel
+from backend.bot import bot, dp, notify_admins, publish_message_to_channel, start_bot_polling
 
 app = FastAPI(title="TDIU University Telegram Bot API")
 
@@ -570,8 +570,11 @@ async def admin_broadcast(data: Dict[str, Any] = Body(...)):
     finally:
         await db.close()
 
+bot_polling_task = None
+
 @app.on_event("startup")
 async def startup_event():
+    global bot_polling_task
     await init_db()
     await seed_database()
     if WEBHOOK_URL:
@@ -587,9 +590,19 @@ async def startup_event():
             print("✅ Telegram Webhook registered successfully!")
         except Exception as e:
             print(f"⚠️ Failed to set webhook on startup: {e}")
+    else:
+        print("🚀 WEBHOOK_URL not set: starting Bot Polling in background...")
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+        except Exception:
+            pass
+        bot_polling_task = asyncio.create_task(start_bot_polling())
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    global bot_polling_task
+    if bot_polling_task and not bot_polling_task.done():
+        bot_polling_task.cancel()
     if WEBHOOK_URL:
         print("🛑 Removing Telegram Webhook on shutdown...")
         try:

@@ -26,15 +26,7 @@ async def main():
     )
     server = uvicorn.Server(config)
     
-    if WEBHOOK_URL:
-        logger.info(f"🌐 Running in WEBHOOK mode for Render.com (URL: {WEBHOOK_URL})")
-        await server.serve()
-    else:
-        logger.info("🔄 Running in LOCAL POLLING mode (no WEBHOOK_URL detected)")
-        await asyncio.gather(
-            server.serve(),
-            start_bot_polling()
-        )
+    await server.serve()
 
 if __name__ == "__main__":
     try:
