@@ -49,16 +49,18 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 app.mount("/css", StaticFiles(directory=str(FRONTEND_DIR / "css")), name="css")
 app.mount("/js", StaticFiles(directory=str(FRONTEND_DIR / "js")), name="js")
 
-# Serve main pages & health checks (UptimeRobot ping endpoint)
-@app.get("/")
+# Serve main pages & health checks (UptimeRobot & Render ping endpoint)
+@app.api_route("/", methods=["GET", "HEAD"])
 async def serve_root(request: Request):
     user_agent = request.headers.get("user-agent", "").lower()
     accept = request.headers.get("accept", "")
+    if request.method == "HEAD":
+        return Response(status_code=200)
     if "uptimerobot" in user_agent or "curl" in user_agent or "text/plain" in accept:
         return PlainTextResponse("200 OK", status_code=200)
     return FileResponse(FRONTEND_DIR / "index.html", status_code=200)
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     return PlainTextResponse("200 OK", status_code=200)
 
@@ -74,16 +76,51 @@ async def serve_admin():
 async def handle_telegram_webhook(request: Request):
     secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
     if WEBHOOK_SECRET and secret and secret != WEBHOOK_SECRET:
+        print(f"⚠️ Webhook secret mismatch: received '{secret}'")
         return Response(status_code=status.HTTP_403_FORBIDDEN)
 
     try:
         data = await request.json()
         update = Update.model_validate(data, context={"bot": bot})
+        print(f"📥 Received Telegram Update #{update.update_id}")
         await dp.feed_update(bot=bot, update=update)
         return Response(status_code=status.HTTP_200_OK)
     except Exception as e:
-        print(f"Webhook processing error: {e}")
+        print(f"❌ Webhook processing error: {e}")
         return Response(status_code=status.HTTP_200_OK)
+
+@app.get("/api/webhook/status")
+async def get_webhook_status():
+    try:
+        info = await bot.get_webhook_info()
+        return {
+            "status": "ok",
+            "url": info.url,
+            "has_custom_certificate": info.has_custom_certificate,
+            "pending_update_count": info.pending_update_count,
+            "last_error_date": info.last_error_date,
+            "last_error_message": info.last_error_message
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/webhook/reset")
+async def reset_webhook():
+    try:
+        if WEBHOOK_URL:
+            webhook_full = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
+            await bot.set_webhook(
+                url=webhook_full,
+                secret_token=WEBHOOK_SECRET,
+                drop_pending_updates=False,
+                allowed_updates=["message", "callback_query"]
+            )
+            return {"status": "ok", "message": f"Webhook reset to {webhook_full}"}
+        else:
+            await bot.delete_webhook(drop_pending_updates=False)
+            return {"status": "ok", "message": "Webhook deleted, running in polling mode"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 # -----------------
 # BOT SIMULATOR API
@@ -603,10 +640,4 @@ async def shutdown_event():
     global bot_polling_task
     if bot_polling_task and not bot_polling_task.done():
         bot_polling_task.cancel()
-    if WEBHOOK_URL:
-        print("🛑 Removing Telegram Webhook on shutdown...")
-        try:
-            await bot.delete_webhook()
-        except Exception:
-            pass
     await bot.session.close()
