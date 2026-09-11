@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>По секрету — @TSUE_AnonBot (Telegram)</title>
+  <link rel="stylesheet" href="/css/telegram.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220%200%20100%20100%22><text y=%22.9em%22 font-size=%2290%22>✉️</text></svg>">
+</head>
+<body>
+
+  <!-- Main Telegram Shell -->
+  <div class="telegram-client">
+    
+    <!-- Top Header Bar -->
+    <header class="tg-header">
+      <div class="tg-bot-identity">
+        <div class="tg-avatar">🤫</div>
+        <div class="tg-title-box">
+          <span class="tg-name">По секрету ✓</span>
+          <span class="tg-status">bot • @TSUE_AnonBot</span>
+        </div>
+      </div>
+
+      <div class="tg-header-actions">
+        <!-- Language selector -->
+        <select id="langSelect" style="background:#22262e; color:#fff; border:1px solid rgba(255,255,255,0.1); border-radius:10px; font-size:12px; padding:4px 6px; outline:none; cursor:pointer;">
+          <option value="ru" selected>🇷🇺 RU</option>
+          <option value="uz">🇺🇿 UZ</option>
+          <option value="en">🇬🇧 EN</option>
+        </select>
+
+        <!-- Admin Portal Link -->
+        <a href="/admin" class="tg-admin-link" title="Open Admin Panel">
+          👑 Admin
+        </a>
+      </div>
+    </header>
+
+    <!-- Chat Messages Stream -->
+    <main class="tg-chat-stream" id="chatStream">
+      <!-- Injected by telegram.js -->
+    </main>
+
+    <!-- Bottom Dock: Exact Match to Screenshot -->
+    <footer class="tg-bottom-dock">
+      
+      <!-- Input bar -->
+      <div class="tg-input-bar">
+        <button class="tg-bar-icon-btn" title="Emoji">😊</button>
+        <input type="text" id="msgInput" class="tg-input-field" placeholder="Message" autocomplete="off">
+        <button class="tg-bar-icon-btn" id="toggleKbdBtn" title="Keyboard">⊞</button>
+        <button class="tg-bar-icon-btn" id="attachBtn" title="Attach photo/video">📎</button>
+        <button class="tg-mic-btn" id="micBtn" title="Voice / Send">🎙</button>
+      </div>
+
+      <!-- Real Telegram Reply Keyboard Matching Screenshot -->
+      <div class="tg-reply-keyboard-container" id="keyboardContainer">
+        <!-- Buttons injected dynamically -->
+      </div>
+
+    </footer>
+
+    <!-- Hidden file input for actual photo/video upload -->
+    <input type="file" id="hiddenFileInput" style="display:none;" accept="image/*,video/*">
+
+  </div>
+
+  <script src="/js/telegram.js"></script>
+</body>
+</html>

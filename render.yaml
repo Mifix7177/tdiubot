@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: tdiu-telegram-bot
+    env: python
+    region: frankfurt
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python run.py
+    envVars:
+      - key: BOT_TOKEN
+        value: 8755619754:AAGMukhaxvStDkSedAUOBEUv7T4dOMMiyhk
+      - key: RENDER_EXTERNAL_URL
+        fromService:
+          type: web
+          name: tdiu-telegram-bot
+          property: host
+      - key: WEBHOOK_SECRET
+        generateValue: true

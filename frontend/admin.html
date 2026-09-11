@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Admin Portal — Xabarlar va Murojaatlar Boshqaruvi</title>
+  <link rel="stylesheet" href="/css/admin.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220%200%20100%20100%22><text y=%22.9em%22 font-size=%2290%22>📩</text></svg>">
+</head>
+<body>
+
+  <!-- Left Sidebar -->
+  <aside class="admin-sidebar">
+    <div class="sidebar-header">
+      <div class="sidebar-logo">📩</div>
+      <div class="sidebar-brand">
+        <h2>Xabarlar Markazi</h2>
+        <span>Admin Boshqaruvi</span>
+      </div>
+    </div>
+
+    <nav class="sidebar-nav">
+      <div class="nav-item active" id="nav-all" onclick="setFilter('all')">
+        <span>📥</span>
+        <span>Barcha Xabarlar</span>
+        <span class="nav-badge" id="badgeAll">0</span>
+      </div>
+      <div class="nav-item" id="nav-help" onclick="setFilter('help')">
+        <span>🆘</span>
+        <span>Yordam So'rovlari</span>
+        <span class="nav-badge" id="badgeHelp" style="background:#ef4444;">0</span>
+      </div>
+      <div class="nav-item" id="nav-confession" onclick="setFilter('confession')">
+        <span>💌</span>
+        <span>Iqrornomalar</span>
+        <span class="nav-badge" id="badgeConfession" style="background:#ec4899;">0</span>
+      </div>
+      <div class="nav-item" id="nav-normal" onclick="setFilter('normal')">
+        <span>✉️</span>
+        <span>Oddiy Xabarlar</span>
+      </div>
+      <div class="nav-item" id="nav-media" onclick="setFilter('media')">
+        <span>📷</span>
+        <span>Media Xabarlar</span>
+      </div>
+      <div class="nav-item" id="nav-broadcast" onclick="openBroadcastModal()">
+        <span>📢</span>
+        <span>Ommaviy Xabar</span>
+      </div>
+    </nav>
+
+    <div class="sidebar-footer">
+      <a href="/" class="bot-switch-link" title="Open Telegram Bot Interface">
+        <span>🤖</span>
+        <span>Bot Chatiga o'tish</span>
+      </a>
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="admin-main">
+    
+    <!-- Topbar -->
+    <header class="admin-topbar">
+      <div class="topbar-title">
+        <h1 id="pageTitle">📥 Kelgan Murojaat va Xabarlar</h1>
+      </div>
+      <div class="topbar-actions">
+        <button class="btn btn-primary" onclick="openBroadcastModal()">
+          <span>📢</span>
+          <span>Ommaviy Xabar (Broadcast)</span>
+        </button>
+        <button class="btn btn-secondary" onclick="loadMessages()">
+          <span>🔄</span>
+          <span>Yangilash</span>
+        </button>
+        <div class="admin-badge">
+          👑 Admin (ID: 7058416364)
+        </div>
+      </div>
+    </header>
+
+    <div class="admin-content">
+      
+      <!-- Metrics Overview -->
+      <section class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-header">
+            <span>Jami Xabarlar</span>
+            <div class="metric-icon">💬</div>
+          </div>
+          <div class="metric-value" id="statTotal">0</div>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-header">
+            <span>Yangi / Ko'rilmagan</span>
+            <div class="metric-icon">🔔</div>
+          </div>
+          <div class="metric-value" id="statNew" style="color:#f87171;">0</div>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-header">
+            <span>Anonim Iqrornomalar</span>
+            <div class="metric-icon">💌</div>
+          </div>
+          <div class="metric-value" id="statConfessions" style="color:#f472b6;">0</div>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-header">
+            <span>Javob Berilgan</span>
+            <div class="metric-icon">✅</div>
+          </div>
+          <div class="metric-value" id="statReplied" style="color:#34d399;">0</div>
+        </div>
+      </section>
+
+      <!-- Main Messages Table Section -->
+      <section class="admin-panel-card">
+        <div class="panel-header">
+          <div style="display:flex; align-items:center; gap:12px;">
+            <h3 id="tableHeaderTitle"><span>📬</span> Kelgan Xabarlar Ro'yxati</h3>
+            <span id="filteredCount" style="font-size:13px; color:var(--text-muted);">(Jami: 0)</span>
+          </div>
+
+          <!-- Quick Filter Pills -->
+          <div style="display:flex; gap:8px;">
+            <button class="btn btn-secondary btn-sm filter-pill active" onclick="setFilter('all', this)">Barchasi</button>
+            <button class="btn btn-secondary btn-sm filter-pill" onclick="setFilter('help', this)">🆘 Yordam</button>
+            <button class="btn btn-secondary btn-sm filter-pill" onclick="setFilter('confession', this)">💌 Iqrornoma</button>
+            <button class="btn btn-secondary btn-sm filter-pill" onclick="setFilter('normal', this)">✉️ Oddiy</button>
+            <button class="btn btn-secondary btn-sm filter-pill" onclick="setFilter('media', this)">🎬 Media</button>
+          </div>
+        </div>
+
+        <!-- Table -->
+        <div class="admin-table-container">
+          <table class="admin-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Yuboruvchi</th>
+                <th>Turi</th>
+                <th>Xabar Mazmuni</th>
+                <th>Status</th>
+                <th>Kelgan Vaqti</th>
+                <th>Amal</th>
+              </tr>
+            </thead>
+            <tbody id="messagesTableBody">
+              <!-- Dynamically populated by admin.js -->
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+    </div>
+  </main>
+
+  <!-- =================================================== -->
+  <!-- MODAL 1: REPLY TO USER -->
+  <!-- =================================================== -->
+  <div class="modal-overlay" id="replyModal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3>💬 Foydalanuvchiga Javob Yozish</h3>
+        <button class="modal-close-btn" onclick="closeReplyModal()">&times;</button>
+      </div>
+
+      <div style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); padding:14px; border-radius:10px; margin-bottom:16px;">
+        <div style="font-size:12px; color:var(--text-muted); margin-bottom:4px;">
+          Foydalanuvchi: <b id="replyTargetUser" style="color:#ffffff;"></b>
+        </div>
+        <div style="font-size:14px; line-height:1.4;" id="replyOrigContent"></div>
+      </div>
+
+      <div class="form-group">
+        <label>Adminning rasmiy javobi (Telegram orqali to'g'ridan-to'g'ri yuboriladi):</label>
+        <textarea id="replyTextArea" class="form-control" rows="5" placeholder="Javob matnini yozing..."></textarea>
+      </div>
+
+      <div style="display:flex; justify-content:flex-end; gap:10px;">
+        <button class="btn btn-secondary" onclick="closeReplyModal()">Bekor qilish</button>
+        <button class="btn btn-success" onclick="sendReply()">🚀 Telegram orqali yuborish</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- =================================================== -->
+  <!-- MODAL 2: BROADCAST MESSAGE -->
+  <!-- =================================================== -->
+  <div class="modal-overlay" id="broadcastModal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3>📢 Ommaviy Xabar (Broadcast)</h3>
+        <button class="modal-close-btn" onclick="closeBroadcastModal()">&times;</button>
+      </div>
+
+      <p style="font-size:13px; color:var(--text-muted); margin-bottom:14px;">
+        Ushbu xabar barcha Telegram bot foydalanuvchilariga bir zumda yuboriladi.
+      </p>
+
+      <div class="form-group">
+        <label>E'lon matni:</label>
+        <textarea id="broadcastText" class="form-control" rows="5" placeholder="Barcha foydalanuvchilarga yuboriladigan e'lon matnini kiriting..."></textarea>
+      </div>
+
+      <div style="display:flex; justify-content:flex-end; gap:10px;">
+        <button class="btn btn-secondary" onclick="closeBroadcastModal()">Bekor qilish</button>
+        <button class="btn btn-primary" onclick="sendBroadcast()">🚀 Hammaga Yuborish</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/js/admin.js"></script>
+</body>
+</html>
