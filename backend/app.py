@@ -552,6 +552,10 @@ async def get_users_list():
 async def update_user_role_admin(uid: int, data: Dict[str, Any] = Body(...)):
     role = data.get("role", "student")
     await update_user_role(uid, role)
+    if role == "admin" and uid not in ADMIN_IDS:
+        ADMIN_IDS.append(uid)
+    elif role != "admin" and uid in ADMIN_IDS:
+        ADMIN_IDS.remove(uid)
     return {"status": "ok", "role": role}
 
 # SETTINGS ENDPOINT
@@ -614,6 +618,17 @@ async def startup_event():
     global bot_polling_task
     await init_db()
     await seed_database()
+    
+    # Sync admin IDs from database
+    db = await get_db()
+    try:
+        cur = await db.execute("SELECT telegram_id FROM users WHERE role = 'admin'")
+        admins = await cur.fetchall()
+        for a in admins:
+            if a[0] not in ADMIN_IDS:
+                ADMIN_IDS.append(a[0])
+    finally:
+        await db.close()
     if WEBHOOK_URL:
         webhook_full = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
         print(f"🚀 Registering Telegram Webhook: {webhook_full}")

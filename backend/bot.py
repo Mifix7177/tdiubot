@@ -51,6 +51,7 @@ admin_channel_sessions: Set[int] = set()
 admin_search_user_sessions: Set[int] = set()
 admin_search_history_sessions: Set[int] = set()
 admin_add_admin_sessions: Set[int] = set()
+admin_remove_admin_sessions: Set[int] = set()
 
 def build_reply_keyboard(keyboard_grid):
     if not keyboard_grid:
@@ -831,20 +832,40 @@ async def cb_admin_admins(query: CallbackQuery):
 
     db = await get_db()
     try:
-        cur = await db.execute("SELECT telegram_id, full_name, username FROM users WHERE role = 'admin' OR telegram_id IN (?, ?)", (ADMIN_IDS[0], ADMIN_IDS[-1]))
+        cur = await db.execute("SELECT telegram_id, full_name, username FROM users WHERE role = 'admin'")
         admins = await cur.fetchall()
+        existing_ids = {a['telegram_id'] for a in admins}
+        for aid in ADMIN_IDS:
+            if aid not in existing_ids:
+                admins.append({"telegram_id": aid, "full_name": f"Admin {aid}", "username": ""})
     finally:
         await db.close()
 
-    lines = ["👨‍💼 <b>Список администраторов бота:</b>\n"]
+    lines = ["👨‍💼 <b>Список администраторов бота / Bot administratorlari:</b>\n"]
+    admin_buttons = []
+    
     for idx, a in enumerate(admins, 1):
-        uname = f"@{a['username']}" if a['username'] else "нет username"
-        lines.append(f"{idx}. 👑 <b>{a['full_name']}</b> ({uname}) — ID: <code>{a['telegram_id']}</code>")
+        uname = f"@{a['username']}" if a['username'] else "yo'q"
+        name = a['full_name'] or f"Admin {a['telegram_id']}"
+        lines.append(f"{idx}. 👑 <b>{name}</b> ({uname}) — ID: <code>{a['telegram_id']}</code>")
+        if a['telegram_id'] != admin_id:
+            admin_buttons.append([
+                InlineKeyboardButton(
+                    text=f"🗑️ O'chirish (ID: {a['telegram_id']})", 
+                    callback_data=f"admin_remove_direct:{a['telegram_id']}"
+                )
+            ])
 
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить администратора", callback_data="admin_add_admin_prompt")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_menu")]
-    ])
+    action_buttons = [
+        [
+            InlineKeyboardButton(text="➕ Admin qo'shish", callback_data="admin_add_admin_prompt"),
+            InlineKeyboardButton(text="➖ ID bo'yicha o'chirish", callback_data="admin_remove_admin_prompt")
+        ]
+    ]
+    action_buttons.extend(admin_buttons)
+    action_buttons.append([InlineKeyboardButton(text="🔙 Orqaga / Назад", callback_data="admin_menu")])
+
+    markup = InlineKeyboardMarkup(inline_keyboard=action_buttons)
 
     try:
         await query.message.edit_text("\n".join(lines), reply_markup=markup)
@@ -1249,6 +1270,7 @@ async def cb_cancel_admin_action(query: CallbackQuery):
     admin_search_user_sessions.discard(admin_id)
     admin_search_history_sessions.discard(admin_id)
     admin_add_admin_sessions.discard(admin_id)
+    admin_remove_admin_sessions.discard(admin_id)
     try:
         await query.message.edit_text("❌ Действие отменено.", reply_markup=get_back_to_admin_markup())
     except Exception:
@@ -1299,6 +1321,50 @@ async def cb_add_admin_prompt(query: CallbackQuery):
         reply_markup=cancel_markup
     )
     await query.answer()
+
+@dp.callback_query(F.data == "admin_remove_admin_prompt")
+async def cb_remove_admin_prompt(query: CallbackQuery):
+    admin_id = query.from_user.id
+    if admin_id not in ADMIN_IDS:
+        return
+    admin_remove_admin_sessions.add(admin_id)
+    cancel_markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена / Bekor qilish", callback_data="cancel_admin_action")]
+    ])
+    await query.message.answer(
+        "➖ <b>O'chirmoqchi bo'lgan administratorning Telegram ID raqamini kiriting:</b>\n\n"
+        "<i>(Masalan: <code>123456789</code>)</i>",
+        reply_markup=cancel_markup
+    )
+    await query.answer()
+
+@dp.callback_query(F.data.startswith("admin_remove_direct:"))
+async def cb_remove_admin_direct(query: CallbackQuery):
+    admin_id = query.from_user.id
+    if admin_id not in ADMIN_IDS:
+        return
+    try:
+        target_id = int(query.data.split(":")[1])
+    except (ValueError, IndexError):
+        await query.answer("Xatolik!", show_alert=True)
+        return
+
+    if target_id == admin_id:
+        await query.answer("⚠️ O'zingizni administratorlikdan o'chira olmaysiz!", show_alert=True)
+        return
+
+    if target_id in ADMIN_IDS:
+        ADMIN_IDS.remove(target_id)
+
+    db = await get_db()
+    try:
+        await db.execute("UPDATE users SET role = 'student' WHERE telegram_id = ?", (target_id,))
+        await db.commit()
+    finally:
+        await db.close()
+
+    await query.answer(f"✅ Administrator (ID: {target_id}) muvaffaqiyatli o'chirildi!", show_alert=True)
+    await cb_admin_admins(query)
 
 @dp.callback_query(F.data == "admin_set_channel_prompt")
 async def cb_set_channel_prompt(query: CallbackQuery):
@@ -2032,6 +2098,32 @@ async def handle_text(message: types.Message):
             await db.close()
 
         await message.answer(f"✅ Administrator muvaffaqiyatli qo'shildi: <code>{new_admin_id}</code>", reply_markup=get_back_to_admin_markup())
+        return
+
+    # 6.1 Check if Admin is removing an admin by ID
+    if user_id in admin_remove_admin_sessions:
+        admin_remove_admin_sessions.discard(user_id)
+        rem_id_str = user_text.strip()
+        if not rem_id_str.isdigit():
+            await message.answer("⚠️ ID faqat raqamlardan iborat bo'lishi kerak.", reply_markup=get_back_to_admin_markup())
+            return
+
+        rem_admin_id = int(rem_id_str)
+        if rem_admin_id == user_id:
+            await message.answer("⚠️ O'zingizni administratorlikdan o'chira olmaysiz!", reply_markup=get_back_to_admin_markup())
+            return
+
+        if rem_admin_id in ADMIN_IDS:
+            ADMIN_IDS.remove(rem_admin_id)
+
+        db = await get_db()
+        try:
+            await db.execute("UPDATE users SET role = 'student' WHERE telegram_id = ?", (rem_admin_id,))
+            await db.commit()
+        finally:
+            await db.close()
+
+        await message.answer(f"✅ Administrator (ID: <code>{rem_admin_id}</code>) muvaffaqiyatli o'chirildi va huquqlari bekor qilindi.", reply_markup=get_back_to_admin_markup())
         return
 
     # 7. Check if user is requesting Admin Panel via text
