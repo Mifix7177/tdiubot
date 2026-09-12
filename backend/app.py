@@ -411,8 +411,8 @@ async def reply_to_message(msg_id: int, data: Dict[str, Any] = Body(...), backgr
 async def admin_publish_message(msg_id: int):
     """Admin endpoint to approve and publish a message to the channel."""
     try:
-        channel_msg_id = await publish_message_to_channel(msg_id)
-        return {"status": "ok", "channel_message_id": channel_msg_id}
+        channel_msg_id, channel_order = await publish_message_to_channel(msg_id)
+        return {"status": "ok", "channel_message_id": channel_msg_id, "channel_order": channel_order}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -437,9 +437,9 @@ async def admin_reject_message(msg_id: int):
             user_profile = await get_user_profile(u_id)
             u_lang = user_profile.get("language", "uz") if user_profile else "uz"
             notif = {
-                "uz": f"ℹ️ <b>Xabaringiz (#{msg_id}) moderator tomonidan rad etildi.</b>",
-                "ru": f"ℹ️ <b>Ваше сообщение (#{msg_id}) было отклонено модератором.</b>",
-                "en": f"ℹ️ <b>Your message (#{msg_id}) was rejected by the moderator.</b>"
+                "uz": "ℹ️ <b>Xabaringiz moderator tomonidan rad etildi (kanalga chiqarilmadi).</b>",
+                "ru": "ℹ️ <b>Ваше сообщение было отклонено модератором (не опубликовано в канале).</b>",
+                "en": "ℹ️ <b>Your message was rejected by the moderator (not published).</b>"
             }
             await bot.send_message(u_id, notif.get(u_lang, notif["uz"]))
         except Exception:

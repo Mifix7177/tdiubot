@@ -132,8 +132,12 @@ function renderTable() {
       `;
     }
 
+    const idHtml = m.channel_order 
+      ? `<b style="color:#10b981;">#${m.channel_order}</b> <small style="color:var(--text-muted); font-size:11px;">(ID: ${m.id})</small>`
+      : `<b>#${m.id}</b>`;
+
     tr.innerHTML = `
-      <td><b>#${m.id}</b></td>
+      <td>${idHtml}</td>
       <td>
         <b>${escapeHtml(m.user_name || "Noma'lum")}</b><br>
         <small style="color:var(--text-muted); font-family:monospace;">ID: ${m.user_id}</small>

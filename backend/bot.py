@@ -2,7 +2,7 @@ import asyncio
 import logging
 import re
 from datetime import datetime
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Any, Optional, Set, Tuple
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
@@ -76,16 +76,37 @@ def get_type_badge(msg_type: str) -> str:
     }
     return badges.get(msg_type, f"📝 {msg_type}")
 
-def format_admin_notification(user_name: str, username: str, user_id: int, msg_type: str, content: str, db_msg_id: Optional[int] = None, is_auto_published: bool = False) -> str:
+def format_admin_notification(
+    user_name: str, 
+    username: str, 
+    user_id: int, 
+    msg_type: str, 
+    content: str, 
+    db_msg_id: Optional[int] = None, 
+    is_auto_published: bool = False,
+    channel_order: Optional[int] = None,
+    next_channel_order: Optional[int] = None
+) -> str:
     """Notification template for admins."""
     uname = f"@{username}" if username else "Нет"
     badge = get_type_badge(msg_type)
-    id_tag = f" <b>#{db_msg_id}</b>" if db_msg_id else ""
-    status_line = (
-        "📢 <b>Kanalga avtomatik joylandi / Опубликовано в канал!</b>"
-        if is_auto_published else
-        "⏳ <b>Moderatsiya: Kanalga chiqarish uchun quyidagi «✅ Опубликовать (Approve)» tugmasini bosing.</b>"
-    )
+    
+    display_id = None
+    if channel_order:
+        display_id = channel_order
+    elif next_channel_order:
+        display_id = next_channel_order
+    elif db_msg_id:
+        display_id = db_msg_id
+
+    id_tag = f" <b>#{display_id}</b>" if display_id else ""
+    if is_auto_published:
+        status_line = f"📢 <b>Kanalga avtomatik joylandi (ID: #{display_id}) / Опубликовано в канал!</b>"
+    elif next_channel_order:
+        status_line = f"⏳ <b>Moderatsiya: Kanalga chiqarish uchun quyidagi «✅ Опубликовать (Approve)» tugmasini bosing (Kanal ID: #{display_id}).</b>"
+    else:
+        status_line = "⏳ <b>Moderatsiya: Kanalga chiqarish uchun quyidagi «✅ Опубликовать (Approve)» tugmasini bosing.</b>"
+
     return (
         f"📩 <b>Новое сообщение{id_tag}</b>\n\n"
         f"👤 <b>Имя:</b> {user_name}\n"
@@ -123,10 +144,32 @@ def get_message_action_markup(db_msg_id: int, user_id: int, is_auto_published: b
         ]
     ])
 
-async def publish_message_to_channel(db_msg_id: int) -> Optional[int]:
+async def get_next_channel_order() -> int:
+    """Calculates next sequential channel post ID.
+    Starts from 15 (or custom setting). Rejected/cancelled posts never consume an ID.
+    """
+    db = await get_db()
+    try:
+        cur = await db.execute("SELECT MAX(channel_order) FROM messages WHERE channel_order IS NOT NULL")
+        row = await cur.fetchone()
+        max_order = row[0] if row and row[0] is not None else None
+        
+        start_setting = await get_setting("channel_start_order", "15")
+        try:
+            start_num = int(start_setting)
+        except (ValueError, TypeError):
+            start_num = 15
+
+        if max_order is None or max_order < (start_num - 1):
+            return start_num
+        return max_order + 1
+    finally:
+        await db.close()
+
+async def publish_message_to_channel(db_msg_id: int) -> Tuple[Optional[str], int]:
     """Publishes a message from DB to the configured channel with #{channel_order} • {category}.
-    channel_order is a sequential counter of published-only messages (reject/cancel gaps are skipped).
-    Returns channel message_id on success, raises Exception on failure.
+    channel_order is a sequential counter of published-only messages (starts at #15, reject/cancel gaps are skipped).
+    Returns (channel_message_id, channel_order) on success, raises Exception on failure.
     """
     channel = await get_setting("channel_username") or "@TSUE_Anon"
     channel = channel.strip()
@@ -137,7 +180,7 @@ async def publish_message_to_channel(db_msg_id: int) -> Optional[int]:
     row = None
     try:
         cur = await db.execute("""
-        SELECT user_id, user_name, msg_type, content, media_url, media_type, status, created_at 
+        SELECT user_id, user_name, msg_type, content, media_url, media_type, status, created_at, channel_order, channel_message_id 
         FROM messages WHERE id = ?
         """, (db_msg_id,))
         row = await cur.fetchone()
@@ -147,21 +190,16 @@ async def publish_message_to_channel(db_msg_id: int) -> Optional[int]:
     if not row:
         raise ValueError("Xabar topilmadi / Message not found")
 
-    u_id, u_name, m_type, m_content, media_url, media_type, m_status, m_created_at = row
+    u_id, u_name, m_type, m_content, media_url, media_type, m_status, m_created_at, existing_order, existing_ch_id = row
 
     if m_status == "cancelled":
         raise ValueError("Xabar foydalanuvchi tomonidan bekor qilingan!")
 
-    # Compute next sequential channel_order (count of already published messages + 1)
-    db = await get_db()
-    try:
-        cur = await db.execute(
-            "SELECT COUNT(*) FROM messages WHERE status = 'published'"
-        )
-        published_count = (await cur.fetchone())[0]
-    finally:
-        await db.close()
-    channel_order = published_count + 1
+    if m_status == "published" and existing_order:
+        return str(existing_ch_id) if existing_ch_id else None, existing_order
+
+    # Compute next sequential channel_order starting from 15 (+1 each)
+    channel_order = existing_order or await get_next_channel_order()
 
     badge = get_type_badge(m_type)
     content_block = f"{m_content}\n\n" if m_content and m_content.strip() else ""
@@ -222,7 +260,7 @@ async def publish_message_to_channel(db_msg_id: int) -> Optional[int]:
     finally:
         await db.close()
 
-    return channel_msg_id
+    return channel_msg_id, channel_order
 
 def get_user_cancel_markup(msg_id: int, lang: str = "uz") -> InlineKeyboardMarkup:
     """Inline button allowing user to cancel within 5 minutes."""
@@ -323,9 +361,14 @@ async def notify_admins(
     content: str, 
     media_file_id: Optional[str] = None, 
     media_type: str = "text",
-    is_auto_published: bool = False
+    is_auto_published: bool = False,
+    channel_order: Optional[int] = None
 ):
     """Sends immediate Telegram notifications to all ADMIN_IDS following the requested template."""
+    next_order = None
+    if not is_auto_published:
+        next_order = await get_next_channel_order()
+
     admin_text = format_admin_notification(
         user_name=user_name,
         username=username,
@@ -333,7 +376,9 @@ async def notify_admins(
         msg_type=msg_type,
         content=content,
         db_msg_id=db_msg_id,
-        is_auto_published=is_auto_published
+        is_auto_published=is_auto_published,
+        channel_order=channel_order,
+        next_channel_order=next_order
     )
     markup = get_message_action_markup(db_msg_id, user_id, is_auto_published=is_auto_published)
 
@@ -1024,9 +1069,9 @@ async def cb_publish(query: CallbackQuery):
         return
 
     try:
-        await publish_message_to_channel(db_msg_id)
+        channel_msg_id, channel_order = await publish_message_to_channel(db_msg_id)
         channel = await get_setting("channel_username") or "@TSUE_Anon"
-        success_tag = f"\n\n✅ <b>Опубликовано в канале {channel} (ID: #{db_msg_id})!</b>"
+        success_tag = f"\n\n✅ <b>Опубликовано в канале {channel} (ID: #{channel_order})!</b>"
         post_markup = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="🗑️ Удалить из канала", callback_data=f"delete_channel_post:{db_msg_id}"),
@@ -1039,7 +1084,7 @@ async def cb_publish(query: CallbackQuery):
                 await query.message.edit_caption(caption=query.message.caption + success_tag, reply_markup=post_markup)
         except Exception:
             pass
-        await query.answer("✅ Успешно опубликовано в канал!")
+        await query.answer(f"✅ Успешно опубликовано в канал (#{channel_order})!")
     except Exception as e:
         logger.error(f"Failed to publish #{db_msg_id}: {e}")
         await query.answer(f"⚠️ Ошибка публикации: {e}", show_alert=True)
@@ -1121,7 +1166,7 @@ async def cb_reject(query: CallbackQuery):
     finally:
         await db.close()
 
-    reject_tag = f"\n\n❌ <b>Отклонено администратором (ID: #{db_msg_id}).</b>"
+    reject_tag = "\n\n❌ <b>Отклонено администратором (Kanalga chiqarilmadi).</b>"
     try:
         if query.message.text:
             await query.message.edit_text(query.message.text + reject_tag)
@@ -1135,9 +1180,9 @@ async def cb_reject(query: CallbackQuery):
             user_profile = await get_user_profile(u_id)
             u_lang = user_profile.get("language", "uz") if user_profile else "uz"
             notif = {
-                "uz": f"ℹ️ <b>Xabaringiz (#{db_msg_id}) moderator tomonidan rad etildi.</b>",
-                "ru": f"ℹ️ <b>Ваше сообщение (#{db_msg_id}) было отклонено модератором.</b>",
-                "en": f"ℹ️ <b>Your message (#{db_msg_id}) was rejected by the moderator.</b>"
+                "uz": "ℹ️ <b>Xabaringiz moderator tomonidan rad etildi (kanalga chiqarilmadi).</b>",
+                "ru": "ℹ️ <b>Ваше сообщение было отклонено модератором (не опубликовано в канале).</b>",
+                "en": "ℹ️ <b>Your message was rejected by the moderator (not published).</b>"
             }
             await bot.send_message(u_id, notif.get(u_lang, notif["uz"]))
         except Exception as e:
@@ -1669,24 +1714,25 @@ async def handle_photo(message: types.Message):
 
     is_auto = (await get_setting("auto_post_channel", "0")) == "1"
     published_to_ch = False
+    pub_channel_order = None
     if is_auto and inserted_id:
         try:
-            await publish_message_to_channel(inserted_id)
+            _, pub_channel_order = await publish_message_to_channel(inserted_id)
             published_to_ch = True
         except Exception as e:
             logger.error(f"Auto-post failed for photo #{inserted_id}: {e}")
 
     if published_to_ch:
         conf_text = {
-            "uz": f"✅ <b>Rasmingiz qabul qilindi va kanalga joylandi! (#{inserted_id})</b>\n\n⏳ <i>Sizda 5 daqiqa vaqt bor: agar fikringiz o'zgarsa, quyidagi tugma orqali bekor qilishingiz mumkin. Bekor qilingan rasm kanaldan o'chiriladi.</i>",
-            "ru": f"✅ <b>Ваша фотография принята и опубликована в канале! (#{inserted_id})</b>\n\n⏳ <i>У вас есть 5 минут: если вы передумаете, можете отменить ее кнопкой ниже (она будет удалена из канала).</i>",
-            "en": f"✅ <b>Your photo has been received and published to the channel! (#{inserted_id})</b>\n\n⏳ <i>You have 5 minutes: if you change your mind, you can cancel it using the button below (it will be removed from the channel).</i>"
+            "uz": f"✅ <b>Rasmingiz qabul qilindi va kanalga joylandi! (#{pub_channel_order})</b>\n\n⏳ <i>Sizda 5 daqiqa vaqt bor: agar fikringiz o'zgarsa, quyidagi tugma orqali bekor qilishingiz mumkin. Bekor qilingan rasm kanaldan o'chiriladi.</i>",
+            "ru": f"✅ <b>Ваша фотография принята и опубликована в канале! (#{pub_channel_order})</b>\n\n⏳ <i>У вас есть 5 минут: если вы передумаете, можете отменить ее кнопкой ниже (она будет удалена из канала).</i>",
+            "en": f"✅ <b>Your photo has been received and published to the channel! (#{pub_channel_order})</b>\n\n⏳ <i>You have 5 minutes: if you change your mind, you can cancel it using the button below (it will be removed from the channel).</i>"
         }
     else:
         conf_text = {
-            "uz": f"✅ <b>Rasmingiz qabul qilindi va moderatorga yetkazildi. (#{inserted_id})</b>\n\n⏳ <i>Admin tasdiqlaganidan so'ng kanalga chiqariladi. Agar fikringiz o'zgarsa, 5 daqiqa ichida quyidagi tugma orqali bekor qilishingiz mumkin.</i>",
-            "ru": f"✅ <b>Ваша фотография принята и отправлена на модерацию админу. (#{inserted_id})</b>\n\n⏳ <i>Она будет опубликована в канале после одобрения. У вас есть 5 минут, чтобы отменить ее.</i>",
-            "en": f"✅ <b>Your photo has been received and sent for admin moderation. (#{inserted_id})</b>\n\n⏳ <i>It will be published to the channel after approval. You have 5 minutes to cancel it.</i>"
+            "uz": "✅ <b>Rasmingiz qabul qilindi va moderatorga yetkazildi.</b>\n\n⏳ <i>Admin tasdiqlaganidan so'ng kanalga chiqariladi. Agar fikringiz o'zgarsa, 5 daqiqa ichida quyidagi tugma orqali bekor qilishingiz mumkin.</i>",
+            "ru": "✅ <b>Ваша фотография принята и отправлена на модерацию админу.</b>\n\n⏳ <i>Она будет опубликована в канале после одобрения. У вас есть 5 минут, чтобы отменить ее.</i>",
+            "en": "✅ <b>Your photo has been received and sent for admin moderation.</b>\n\n⏳ <i>It will be published to the channel after approval. You have 5 minutes to cancel it.</i>"
         }
     await message.answer(conf_text.get(lang, conf_text["uz"]), reply_markup=cancel_markup)
     await message.answer("Asosiy menyu:" if lang == "uz" else ("Главное меню:" if lang == "ru" else "Main menu:"), reply_markup=markup)
@@ -1701,7 +1747,8 @@ async def handle_photo(message: types.Message):
             content=caption,
             media_file_id=photo.file_id,
             media_type="photo",
-            is_auto_published=published_to_ch
+            is_auto_published=published_to_ch,
+            channel_order=pub_channel_order
         )
 
 @dp.message(F.video)
@@ -1742,24 +1789,25 @@ async def handle_video(message: types.Message):
 
     is_auto = (await get_setting("auto_post_channel", "0")) == "1"
     published_to_ch = False
+    pub_channel_order = None
     if is_auto and inserted_id:
         try:
-            await publish_message_to_channel(inserted_id)
+            _, pub_channel_order = await publish_message_to_channel(inserted_id)
             published_to_ch = True
         except Exception as e:
             logger.error(f"Auto-post failed for video #{inserted_id}: {e}")
 
     if published_to_ch:
         conf_text = {
-            "uz": f"🎥 <b>Videongiz qabul qilindi va kanalga joylandi! (#{inserted_id})</b>\n\n⏳ <i>Sizda 5 daqiqa vaqt bor: agar fikringiz o'zgarsa, quyidagi tugma orqali bekor qilishingiz mumkin. Bekor qilingan video kanaldan o'chiriladi.</i>",
-            "ru": f"🎥 <b>Ваше видео принято и опубликовано в канале! (#{inserted_id})</b>\n\n⏳ <i>У вас есть 5 минут: если вы передумаете, можете отменить его кнопкой ниже (оно будет удалено из канала).</i>",
-            "en": f"🎥 <b>Your video has been received and published to the channel! (#{inserted_id})</b>\n\n⏳ <i>You have 5 minutes: if you change your mind, you can cancel it using the button below (it will be removed from the channel).</i>"
+            "uz": f"🎥 <b>Videongiz qabul qilindi va kanalga joylandi! (#{pub_channel_order})</b>\n\n⏳ <i>Sizda 5 daqiqa vaqt bor: agar fikringiz o'zgarsa, quyidagi tugma orqali bekor qilishingiz mumkin. Bekor qilingan video kanaldan o'chiriladi.</i>",
+            "ru": f"🎥 <b>Ваше видео принято и опубликовано в канале! (#{pub_channel_order})</b>\n\n⏳ <i>У вас есть 5 минут: если вы передумаете, можете отменить его кнопкой ниже (оно будет удалено из канала).</i>",
+            "en": f"🎥 <b>Your video has been received and published to the channel! (#{pub_channel_order})</b>\n\n⏳ <i>You have 5 minutes: if you change your mind, you can cancel it using the button below (it will be removed from the channel).</i>"
         }
     else:
         conf_text = {
-            "uz": f"🎥 <b>Videongiz qabul qilindi va moderatorga yetkazildi. (#{inserted_id})</b>\n\n⏳ <i>Admin tasdiqlaganidan so'ng kanalga chiqariladi. Agar fikringiz o'zgarsa, 5 daqiqa ichida quyidagi tugma orqali bekor qilishingiz mumkin.</i>",
-            "ru": f"🎥 <b>Ваше видео принято и отправлено на модерацию админу. (#{inserted_id})</b>\n\n⏳ <i>Оно будет опубликовано в канале после одобрения. У вас есть 5 минут, чтобы отменить его.</i>",
-            "en": f"🎥 <b>Your video has been received and sent for admin moderation. (#{inserted_id})</b>\n\n⏳ <i>It will be published to the channel after approval. You have 5 minutes to cancel it.</i>"
+            "uz": "🎥 <b>Videongiz qabul qilindi va moderatorga yetkazildi.</b>\n\n⏳ <i>Admin tasdiqlaganidan so'ng kanalga chiqariladi. Agar fikringiz o'zgarsa, 5 daqiqa ichida quyidagi tugma orqali bekor qilishingiz mumkin.</i>",
+            "ru": "🎥 <b>Ваше видео принято и отправлено на модерацию админу.</b>\n\n⏳ <i>Оно будет опубликовано в канале после одобрения. У вас есть 5 минут, чтобы отменить его.</i>",
+            "en": "🎥 <b>Your video has been received and sent for admin moderation.</b>\n\n⏳ <i>It will be published to the channel after approval. You have 5 minutes to cancel it.</i>"
         }
     await message.answer(conf_text.get(lang, conf_text["uz"]), reply_markup=cancel_markup)
     await message.answer("Asosiy menyu:" if lang == "uz" else ("Главное меню:" if lang == "ru" else "Main menu:"), reply_markup=markup)
@@ -1774,7 +1822,8 @@ async def handle_video(message: types.Message):
             content=caption,
             media_file_id=video.file_id,
             media_type="video",
-            is_auto_published=published_to_ch
+            is_auto_published=published_to_ch,
+            channel_order=pub_channel_order
         )
 
 @dp.message(F.video_note)
@@ -1814,24 +1863,25 @@ async def handle_video_note(message: types.Message):
 
     is_auto = (await get_setting("auto_post_channel", "0")) == "1"
     published_to_ch = False
+    pub_channel_order = None
     if is_auto and inserted_id:
         try:
-            await publish_message_to_channel(inserted_id)
+            _, pub_channel_order = await publish_message_to_channel(inserted_id)
             published_to_ch = True
         except Exception as e:
             logger.error(f"Auto-post failed for video_note #{inserted_id}: {e}")
 
     if published_to_ch:
         conf_text = {
-            "uz": f"🎞 <b>Dumaloq video-xabaringiz qabul qilindi va kanalga joylandi! (#{inserted_id})</b>\n\n⏳ <i>Sizda 5 daqiqa vaqt bor: agar fikringiz o'zgarsa, quyidagi tugma orqali bekor qilishingiz mumkin. Bekor qilingan video kanaldan o'chiriladi.</i>",
-            "ru": f"🎞 <b>Круглое видеосообщение принято и опубликовано в канале! (#{inserted_id})</b>\n\n⏳ <i>У вас есть 5 минут: если вы передумаете, можете отменить его кнопкой ниже (оно будет удалено из канала).</i>",
-            "en": f"🎞 <b>Your video note has been received and published to the channel! (#{inserted_id})</b>\n\n⏳ <i>You have 5 minutes: if you change your mind, you can cancel it using the button below (it will be removed from the channel).</i>"
+            "uz": f"🎞 <b>Dumaloq video-xabaringiz qabul qilindi va kanalga joylandi! (#{pub_channel_order})</b>\n\n⏳ <i>Sizda 5 daqiqa vaqt bor: agar fikringiz o'zgarsa, quyidagi tugma orqali bekor qilishingiz mumkin. Bekor qilingan video kanaldan o'chiriladi.</i>",
+            "ru": f"🎞 <b>Круглое видеосообщение принято и опубликовано в канале! (#{pub_channel_order})</b>\n\n⏳ <i>У вас есть 5 минут: если вы передумаете, можете отменить его кнопкой ниже (оно будет удалено из канала).</i>",
+            "en": f"🎞 <b>Your video note has been received and published to the channel! (#{pub_channel_order})</b>\n\n⏳ <i>You have 5 minutes: if you change your mind, you can cancel it using the button below (it will be removed from the channel).</i>"
         }
     else:
         conf_text = {
-            "uz": f"🎞 <b>Dumaloq video-xabaringiz qabul qilindi va moderatorga yetkazildi. (#{inserted_id})</b>\n\n⏳ <i>Admin tasdiqlaganidan so'ng kanalga chiqariladi. Agar fikringiz o'zgarsa, 5 daqiqa ichida quyidagi tugma orqali bekor qilishingiz mumkin.</i>",
-            "ru": f"🎞 <b>Круглое видеосообщение принято и отправлено на модерацию. (#{inserted_id})</b>\n\n⏳ <i>Оно будет опубликовано в канале после одобрения. У вас есть 5 минут, чтобы отменить его.</i>",
-            "en": f"🎞 <b>Your video note has been received and sent for moderation. (#{inserted_id})</b>\n\n⏳ <i>It will be published to the channel after approval. You have 5 minutes to cancel it.</i>"
+            "uz": "🎞 <b>Dumaloq video-xabaringiz qabul qilindi va moderatorga yetkazildi.</b>\n\n⏳ <i>Admin tasdiqlaganidan so'ng kanalga chiqariladi. Agar fikringiz o'zgarsa, 5 daqiqa ichida quyidagi tugma orqali bekor qilishingiz mumkin.</i>",
+            "ru": "🎞 <b>Круглое видеосообщение принято и отправлено на модерацию.</b>\n\n⏳ <i>Оно будет опубликовано в канале после одобрения. У вас есть 5 минут, чтобы отменить его.</i>",
+            "en": "🎞 <b>Your video note has been received and sent for moderation.</b>\n\n⏳ <i>It will be published to the channel after approval. You have 5 minutes to cancel it.</i>"
         }
     await message.answer(conf_text.get(lang, conf_text["uz"]), reply_markup=cancel_markup)
     await message.answer("Asosiy menyu:" if lang == "uz" else ("Главное меню:" if lang == "ru" else "Main menu:"), reply_markup=markup)
@@ -1846,7 +1896,8 @@ async def handle_video_note(message: types.Message):
             content="",
             media_file_id=vn.file_id,
             media_type="video_note",
-            is_auto_published=published_to_ch
+            is_auto_published=published_to_ch,
+            channel_order=pub_channel_order
         )
 
 @dp.message(F.voice)
@@ -1886,24 +1937,25 @@ async def handle_voice(message: types.Message):
 
     is_auto = (await get_setting("auto_post_channel", "0")) == "1"
     published_to_ch = False
+    pub_channel_order = None
     if is_auto and inserted_id:
         try:
-            await publish_message_to_channel(inserted_id)
+            _, pub_channel_order = await publish_message_to_channel(inserted_id)
             published_to_ch = True
         except Exception as e:
             logger.error(f"Auto-post failed for voice #{inserted_id}: {e}")
 
     if published_to_ch:
         conf_text = {
-            "uz": f"🎙 <b>Ovozli xabaringiz qabul qilindi va kanalga joylandi! (#{inserted_id})</b>\n\n⏳ <i>Sizda 5 daqiqa vaqt bor: agar fikringiz o'zgarsa, quyidagi tugma orqali bekor qilishingiz mumkin. Bekor qilingan ovozli xabar kanaldan o'chiriladi.</i>",
-            "ru": f"🎙 <b>Голосовое сообщение принято и опубликовано в канале! (#{inserted_id})</b>\n\n⏳ <i>У вас есть 5 минут: если вы передумаете, можете отменить его кнопкой ниже (оно будет удалено из канала).</i>",
-            "en": f"🎙 <b>Your voice message has been received and published to the channel! (#{inserted_id})</b>\n\n⏳ <i>You have 5 minutes: if you change your mind, you can cancel it using the button below (it will be removed from the channel).</i>"
+            "uz": f"🎙 <b>Ovozli xabaringiz qabul qilindi va kanalga joylandi! (#{pub_channel_order})</b>\n\n⏳ <i>Sizda 5 daqiqa vaqt bor: agar fikringiz o'zgarsa, quyidagi tugma orqali bekor qilishingiz mumkin. Bekor qilingan ovozli xabar kanaldan o'chiriladi.</i>",
+            "ru": f"🎙 <b>Голосовое сообщение принято и опубликовано в канале! (#{pub_channel_order})</b>\n\n⏳ <i>У вас есть 5 минут: если вы передумаете, можете отменить его кнопкой ниже (оно будет удалено из канала).</i>",
+            "en": f"🎙 <b>Your voice message has been received and published to the channel! (#{pub_channel_order})</b>\n\n⏳ <i>You have 5 minutes: if you change your mind, you can cancel it using the button below (it will be removed from the channel).</i>"
         }
     else:
         conf_text = {
-            "uz": f"🎙 <b>Ovozli xabaringiz qabul qilindi va moderatorga yetkazildi. (#{inserted_id})</b>\n\n⏳ <i>Admin tasdiqlaganidan so'ng kanalga chiqariladi. Agar fikringiz o'zgarsa, 5 daqiqa ichida quyidagi tugma orqali bekor qilishingiz mumkin.</i>",
-            "ru": f"🎙 <b>Голосовое сообщение принято и отправлено на модерацию. (#{inserted_id})</b>\n\n⏳ <i>Оно будет опубликовано в канале после одобрения. У вас есть 5 минут, чтобы отменить его.</i>",
-            "en": f"🎙 <b>Your voice message has been received and sent for moderation. (#{inserted_id})</b>\n\n⏳ <i>It will be published to the channel after approval. You have 5 minutes to cancel it.</i>"
+            "uz": "🎙 <b>Ovozli xabaringiz qabul qilindi va moderatorga yetkazildi.</b>\n\n⏳ <i>Admin tasdiqlaganidan so'ng kanalga chiqariladi. Agar fikringiz o'zgarsa, 5 daqiqa ichida quyidagi tugma orqali bekor qilishingiz mumkin.</i>",
+            "ru": "🎙 <b>Голосовое сообщение принято и отправлено на модерацию.</b>\n\n⏳ <i>Оно будет опубликовано в канале после одобрения. У вас есть 5 минут, чтобы отменить его.</i>",
+            "en": "🎙 <b>Your voice message has been received and sent for moderation.</b>\n\n⏳ <i>It will be published to the channel after approval. You have 5 minutes to cancel it.</i>"
         }
     await message.answer(conf_text.get(lang, conf_text["uz"]), reply_markup=cancel_markup)
     await message.answer("Asosiy menyu:" if lang == "uz" else ("Главное меню:" if lang == "ru" else "Main menu:"), reply_markup=markup)
@@ -1918,7 +1970,8 @@ async def handle_voice(message: types.Message):
             content="",
             media_file_id=voice.file_id,
             media_type="voice",
-            is_auto_published=published_to_ch
+            is_auto_published=published_to_ch,
+            channel_order=pub_channel_order
         )
 
 
@@ -2188,9 +2241,10 @@ async def handle_text(message: types.Message):
 
         is_auto = (await get_setting("auto_post_channel", "0")) == "1"
         published_to_ch = False
+        pub_channel_order = None
         if is_auto:
             try:
-                await publish_message_to_channel(inserted_id)
+                _, pub_channel_order = await publish_message_to_channel(inserted_id)
                 published_to_ch = True
             except Exception as e:
                 logger.error(f"Auto-post failed for #{inserted_id}: {e}")
@@ -2199,15 +2253,15 @@ async def handle_text(message: types.Message):
         
         if published_to_ch:
             conf_texts = {
-                "uz": f"✅ <b>Xabaringiz qabul qilindi va kanalga joylandi! (#{inserted_id})</b>\n\n⏳ <i>Sizda 5 daqiqa vaqt bor: agar fikringiz o'zgarsa, quyidagi tugma orqali bekor qilishingiz mumkin. Bekor qilingan xabar kanaldan o'chiriladi.</i>",
-                "ru": f"✅ <b>Ваше сообщение принято и опубликовано в канале! (#{inserted_id})</b>\n\n⏳ <i>У вас есть 5 минут: если вы передумаете, можете отменить его кнопкой ниже (оно будет удалено из канала).</i>",
-                "en": f"✅ <b>Your message has been received and published to the channel! (#{inserted_id})</b>\n\n⏳ <i>You have 5 minutes: if you change your mind, you can cancel it using the button below (it will be removed from the channel).</i>"
+                "uz": f"✅ <b>Xabaringiz qabul qilindi va kanalga joylandi! (#{pub_channel_order})</b>\n\n⏳ <i>Sizda 5 daqiqa vaqt bor: agar fikringiz o'zgarsa, quyidagi tugma orqali bekor qilishingiz mumkin. Bekor qilingan xabar kanaldan o'chiriladi.</i>",
+                "ru": f"✅ <b>Ваше сообщение принято и опубликовано в канале! (#{pub_channel_order})</b>\n\n⏳ <i>У вас есть 5 минут: если вы передумаете, можете отменить его кнопкой ниже (оно будет удалено из канала).</i>",
+                "en": f"✅ <b>Your message has been received and published to the channel! (#{pub_channel_order})</b>\n\n⏳ <i>You have 5 minutes: if you change your mind, you can cancel it using the button below (it will be removed from the channel).</i>"
             }
         else:
             conf_texts = {
-                "uz": f"✅ <b>Xabaringiz qabul qilindi va moderatorga yetkazildi. (#{inserted_id})</b>\n\n⏳ <i>Admin tasdiqlaganidan so'ng kanalga chiqariladi. Agar fikringiz o'zgarsa, 5 daqiqa ichida quyidagi tugma orqali bekor qilishingiz mumkin.</i>",
-                "ru": f"✅ <b>Ваше сообщение принято и отправлено на модерацию админу. (#{inserted_id})</b>\n\n⏳ <i>Оно будет опубликовано в канале после одобрения. У вас есть 5 минут, чтобы отменить его.</i>",
-                "en": f"✅ <b>Your message has been received and sent for admin moderation. (#{inserted_id})</b>\n\n⏳ <i>It will be published to the channel after approval. You have 5 minutes to cancel it.</i>"
+                "uz": "✅ <b>Xabaringiz qabul qilindi va moderatorga yetkazildi.</b>\n\n⏳ <i>Admin tasdiqlaganidan so'ng kanalga chiqariladi. Agar fikringiz o'zgarsa, 5 daqiqa ichida quyidagi tugma orqali bekor qilishingiz mumkin.</i>",
+                "ru": "✅ <b>Ваше сообщение принято и отправлено на модерацию админу.</b>\n\n⏳ <i>Оно будет опубликовано в канале после одобрения. У вас есть 5 минут, чтобы отменить его.</i>",
+                "en": "✅ <b>Your message has been received and sent for admin moderation.</b>\n\n⏳ <i>It will be published to the channel after approval. You have 5 minutes to cancel it.</i>"
             }
         
         await message.answer(conf_texts.get(lang, conf_texts["uz"]), reply_markup=cancel_markup)
@@ -2225,7 +2279,8 @@ async def handle_text(message: types.Message):
             msg_type=result.get("msg_type", "normal"),
             content=result.get("content", user_text),
             media_type="text",
-            is_auto_published=published_to_ch
+            is_auto_published=published_to_ch,
+            channel_order=pub_channel_order
         )
         return
 
