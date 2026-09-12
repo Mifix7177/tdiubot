@@ -92,6 +92,12 @@ async def init_db():
         except Exception:
             pass
 
+        # Migration: channel_order — sequential number for published messages only
+        try:
+            await db.execute("ALTER TABLE messages ADD COLUMN channel_order INTEGER DEFAULT NULL")
+        except Exception:
+            pass
+
 
         # Schedules
         await db.execute("""

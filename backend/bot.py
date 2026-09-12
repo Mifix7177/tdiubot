@@ -124,7 +124,8 @@ def get_message_action_markup(db_msg_id: int, user_id: int, is_auto_published: b
     ])
 
 async def publish_message_to_channel(db_msg_id: int) -> Optional[int]:
-    """Publishes a message from DB to the configured channel with #{id} • {category}.
+    """Publishes a message from DB to the configured channel with #{channel_order} • {category}.
+    channel_order is a sequential counter of published-only messages (reject/cancel gaps are skipped).
     Returns channel message_id on success, raises Exception on failure.
     """
     channel = await get_setting("channel_username") or "@TSUE_Anon"
@@ -151,10 +152,21 @@ async def publish_message_to_channel(db_msg_id: int) -> Optional[int]:
     if m_status == "cancelled":
         raise ValueError("Xabar foydalanuvchi tomonidan bekor qilingan!")
 
+    # Compute next sequential channel_order (count of already published messages + 1)
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM messages WHERE status = 'published'"
+        )
+        published_count = (await cur.fetchone())[0]
+    finally:
+        await db.close()
+    channel_order = published_count + 1
+
     badge = get_type_badge(m_type)
     content_block = f"{m_content}\n\n" if m_content and m_content.strip() else ""
     channel_caption = (
-        f"<b>#{db_msg_id}</b> • {badge}\n\n"
+        f"<b>#{channel_order}</b> • {badge}\n\n"
         f"{content_block}"
         f"<i>🤖 @TSUE_AnonBot</i>"
     )
@@ -187,9 +199,9 @@ async def publish_message_to_channel(db_msg_id: int) -> Optional[int]:
         user_profile = await get_user_profile(u_id)
         u_lang = user_profile.get("language", "uz") if user_profile else "uz"
         notif = {
-            "uz": f"🎉 <b>Xabaringiz (#{db_msg_id}) moderator tomonidan tasdiqlandi va kanalga joylandi!</b>\n\n📢 Kanal: <b>{channel}</b>",
-            "ru": f"🎉 <b>Ваше сообщение (#{db_msg_id}) одобрено администратором и опубликовано в канале!</b>\n\n📢 Канал: <b>{channel}</b>",
-            "en": f"🎉 <b>Your message (#{db_msg_id}) has been approved and published to the channel!</b>\n\n📢 Channel: <b>{channel}</b>"
+            "uz": f"🎉 <b>Xabaringiz (#{channel_order}) moderator tomonidan tasdiqlandi va kanalga joylandi!</b>\n\n📢 Kanal: <b>{channel}</b>",
+            "ru": f"🎉 <b>Ваше сообщение (#{channel_order}) одобрено администратором и опубликовано в канале!</b>\n\n📢 Канал: <b>{channel}</b>",
+            "en": f"🎉 <b>Your message (#{channel_order}) has been approved and published to the channel!</b>\n\n📢 Channel: <b>{channel}</b>"
         }
         sent_user_msg = await bot.send_message(u_id, notif.get(u_lang, notif["uz"]))
         if sent_user_msg:
@@ -198,14 +210,14 @@ async def publish_message_to_channel(db_msg_id: int) -> Optional[int]:
     except Exception as e:
         logger.debug(f"Could not notify user {u_id} of publication: {e}")
 
-    # Mark as published in DB
+    # Mark as published in DB, save channel_order
     db = await get_db()
     try:
         await db.execute("""
         UPDATE messages 
-        SET status = 'published', channel_message_id = ?, user_notify_message_id = ? 
+        SET status = 'published', channel_message_id = ?, user_notify_message_id = ?, channel_order = ?
         WHERE id = ?
-        """, (channel_msg_id, user_notify_msg_id, db_msg_id))
+        """, (channel_msg_id, user_notify_msg_id, channel_order, db_msg_id))
         await db.commit()
     finally:
         await db.close()
