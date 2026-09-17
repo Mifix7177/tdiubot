@@ -53,6 +53,9 @@ admin_search_history_sessions: Set[int] = set()
 admin_add_admin_sessions: Set[int] = set()
 admin_remove_admin_sessions: Set[int] = set()
 
+# Anonymous comment sessions: { user_id: { "channel_msg_id": int, "channel_order": int, "discussion_id": int } }
+anon_reply_sessions: Dict[int, Dict[str, Any]] = {}
+
 def build_reply_keyboard(keyboard_grid):
     if not keyboard_grid:
         return types.ReplyKeyboardRemove()
@@ -259,6 +262,28 @@ async def publish_message_to_channel(db_msg_id: int) -> Tuple[Optional[str], int
         await db.commit()
     finally:
         await db.close()
+
+    # After publishing: send "Reply anonymously" button to discussion group
+    try:
+        channel_chat = await bot.get_chat(channel)
+        discussion_id = getattr(channel_chat, "linked_chat_id", None)
+        if discussion_id and sent_msg:
+            bot_username = (await bot.get_me()).username
+            deep_link = f"https://t.me/{bot_username}?start=reply_{sent_msg.message_id}"
+            anon_btn_markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="✍️ Reply anonymously",
+                    url=deep_link
+                )]
+            ])
+            await bot.send_message(
+                discussion_id,
+                f"<b>#{channel_order}</b> • Anonim komment yozish uchun tugmani bosing:",
+                reply_to_message_id=sent_msg.message_id,
+                reply_markup=anon_btn_markup
+            )
+    except Exception as e:
+        logger.debug(f"Could not send anon reply button to discussion: {e}")
 
     return channel_msg_id, channel_order
 
@@ -515,7 +540,7 @@ async def cb_user_cancel(query: CallbackQuery):
     row = None
     try:
         cur = await db.execute("""
-        SELECT user_id, status, created_at, channel_message_id, user_notify_message_id 
+        SELECT user_id, status, created_at, channel_message_id, user_notify_message_id, channel_order 
         FROM messages WHERE id = ?
         """, (msg_id,))
         row = await cur.fetchone()
@@ -533,6 +558,7 @@ async def cb_user_cancel(query: CallbackQuery):
 
     m_uid, m_status, m_created_at, m_ch_id = row[0], row[1], row[2], row[3]
     u_notif_id = row[4] if len(row) > 4 else None
+    m_channel_order = row[5] if len(row) > 5 else None
 
     if m_uid != user_id:
         not_yours = {
@@ -610,9 +636,11 @@ async def cb_user_cancel(query: CallbackQuery):
             except Exception:
                 pass
             try:
+                # channel_order bor bo'lsa uni, yo'q bo'lsa db msg_id ni ko'rsat
+                display_num = m_channel_order if m_channel_order else msg_id
                 await bot.send_message(
                     a_id, 
-                    f"⚠️ <b>#{msg_id}-sonli xabar foydalanuvchi tomonidan bekor qilindi (Kanalga chiqarilmaydi / Kanaldan o'chirildi).</b>"
+                    f"⚠️ <b>#{display_num}-sonli xabar foydalanuvchi tomonidan bekor qilindi (Kanalga chiqarilmaydi / Kanaldan o'chirildi).</b>"
                 )
             except Exception:
                 pass
@@ -1334,6 +1362,23 @@ async def cb_cancel_admin_action(query: CallbackQuery):
         await query.message.answer("❌ Действие отменено.", reply_markup=get_back_to_admin_markup())
     await query.answer()
 
+@dp.callback_query(F.data == "cancel_anon_reply")
+async def cb_cancel_anon_reply(query: CallbackQuery):
+    user_id = query.from_user.id
+    anon_reply_sessions.pop(user_id, None)
+    user = await get_user_profile(user_id)
+    lang = user.get("language", "uz")
+    msgs = {
+        "uz": "❌ Anonim komment bekor qilindi.",
+        "ru": "❌ Анонимный комментарий отменён.",
+        "en": "❌ Anonymous comment cancelled."
+    }
+    try:
+        await query.message.edit_text(msgs.get(lang, msgs["uz"]))
+    except Exception:
+        await query.message.answer(msgs.get(lang, msgs["uz"]))
+    await query.answer()
+
 @dp.callback_query(F.data == "admin_search_users_prompt")
 async def cb_search_users_prompt(query: CallbackQuery):
     admin_id = query.from_user.id
@@ -1625,6 +1670,46 @@ async def cmd_start(message: types.Message):
         await send_subscription_prompt(message, lang)
         return
 
+    # --- DEEP LINK: /start reply_CHANNEL_MSG_ID ---
+    start_args = message.text.split(maxsplit=1)
+    if len(start_args) > 1 and start_args[1].startswith("reply_"):
+        try:
+            ch_msg_id = int(start_args[1].split("_")[1])
+            # Find channel_order for this message
+            db = await get_db()
+            try:
+                channel = await get_setting("channel_username") or "@TSUE_Anon"
+                channel_chat = await bot.get_chat(channel)
+                discussion_id = getattr(channel_chat, "linked_chat_id", None)
+                cur = await db.execute(
+                    "SELECT channel_order FROM messages WHERE channel_message_id LIKE ?",
+                    (f"%{ch_msg_id}%",)
+                )
+                row = await cur.fetchone()
+            finally:
+                await db.close()
+
+            channel_order_val = row[0] if row else ch_msg_id
+
+            anon_reply_sessions[user_id] = {
+                "channel_msg_id": ch_msg_id,
+                "channel_order": channel_order_val,
+                "discussion_id": discussion_id
+            }
+
+            cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_anon_reply")]
+            ])
+            prompts = {
+                "uz": f"✍️ <b>Post #{channel_order_val}</b> ga anonim komment yozing:\n\n<i>(Matn, rasm, ovoz yoki video yuborishingiz mumkin)</i>",
+                "ru": f"✍️ <b>Напишите анонимный комментарий к посту #{channel_order_val}:</b>\n\n<i>(Можно отправить текст, фото, голос или видео)</i>",
+                "en": f"✍️ <b>Write an anonymous comment for post #{channel_order_val}:</b>\n\n<i>(You can send text, photo, voice or video)</i>"
+            }
+            await message.answer(prompts.get(lang, prompts["uz"]), reply_markup=cancel_kb)
+            return
+        except Exception as e:
+            logger.warning(f"Deep link anon reply parse error: {e}")
+
     result = await process_user_action(user_id, "/start")
     markup = build_reply_keyboard(result.get("keyboard"))
     await message.answer(result["text"], reply_markup=markup)
@@ -1664,6 +1749,34 @@ async def handle_photo(message: types.Message):
     if not await check_channel_subscription(user_id):
         user = await get_user_profile(user_id)
         await send_subscription_prompt(message, user.get("language", "uz"))
+        return
+
+    # --- ANON REPLY SESSION (photo) ---
+    if user_id in anon_reply_sessions:
+        session = anon_reply_sessions.pop(user_id)
+        discussion_id = session.get("discussion_id")
+        ch_msg_id = session.get("channel_msg_id")
+        channel_order_val = session.get("channel_order", ch_msg_id)
+        user = await get_user_profile(user_id)
+        lang = user.get("language", "uz")
+        if not discussion_id:
+            err = {"uz": "⚠️ Kanal discussion guruhi topilmadi.", "ru": "⚠️ Группа обсуждений не найдена.", "en": "⚠️ Discussion group not found."}
+            await message.answer(err.get(lang, err["uz"]))
+            return
+        try:
+            anon_caption = f"💬 <b>Anonim komment</b> (#{channel_order_val})\n\n{caption}" if caption else f"💬 <b>Anonim komment</b> (#{channel_order_val})"
+            await bot.send_photo(
+                discussion_id,
+                photo=photo.file_id,
+                caption=anon_caption,
+                reply_to_message_id=ch_msg_id
+            )
+            ok = {"uz": "✅ Anonim kommentingiz yuborildi!", "ru": "✅ Ваш анонимный комментарий отправлен!", "en": "✅ Your anonymous comment has been sent!"}
+            await message.answer(ok.get(lang, ok["uz"]))
+        except Exception as e:
+            logger.warning(f"Anon photo reply error: {e}")
+            err2 = {"uz": f"⚠️ Yuborishda xatolik: {e}", "ru": f"⚠️ Ошибка отправки: {e}", "en": f"⚠️ Send error: {e}"}
+            await message.answer(err2.get(lang, err2["uz"]))
         return
 
     if user_id in admin_active_reply:
@@ -1768,6 +1881,33 @@ async def handle_video(message: types.Message):
         await send_subscription_prompt(message, user.get("language", "uz"))
         return
 
+    # --- ANON REPLY SESSION (video) ---
+    if user_id in anon_reply_sessions:
+        session = anon_reply_sessions.pop(user_id)
+        discussion_id = session.get("discussion_id")
+        ch_msg_id = session.get("channel_msg_id")
+        channel_order_val = session.get("channel_order", ch_msg_id)
+        user = await get_user_profile(user_id)
+        lang = user.get("language", "uz")
+        if not discussion_id:
+            err = {"uz": "⚠️ Kanal discussion guruhi topilmadi.", "ru": "⚠️ Группа обсуждений не найдена.", "en": "⚠️ Discussion group not found."}
+            await message.answer(err.get(lang, err["uz"]))
+            return
+        try:
+            anon_caption = f"💬 <b>Anonim komment</b> (#{channel_order_val})"
+            await bot.send_video(
+                discussion_id,
+                video=video.file_id,
+                caption=anon_caption,
+                reply_to_message_id=ch_msg_id
+            )
+            ok = {"uz": "✅ Anonim kommentingiz yuborildi!", "ru": "✅ Ваш анонимный комментарий отправлен!", "en": "✅ Your anonymous comment has been sent!"}
+            await message.answer(ok.get(lang, ok["uz"]))
+        except Exception as e:
+            logger.warning(f"Anon video reply error: {e}")
+            await message.answer(f"⚠️ {e}")
+        return
+
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db = await get_db()
     inserted_id = None
@@ -1842,6 +1982,31 @@ async def handle_video_note(message: types.Message):
         await send_subscription_prompt(message, user.get("language", "uz"))
         return
 
+    # --- ANON REPLY SESSION (video_note) ---
+    if user_id in anon_reply_sessions:
+        session = anon_reply_sessions.pop(user_id)
+        discussion_id = session.get("discussion_id")
+        ch_msg_id = session.get("channel_msg_id")
+        channel_order_val = session.get("channel_order", ch_msg_id)
+        user = await get_user_profile(user_id)
+        lang = user.get("language", "uz")
+        if not discussion_id:
+            err = {"uz": "⚠️ Kanal discussion guruhi topilmadi.", "ru": "⚠️ Группа обсуждений не найдена.", "en": "⚠️ Discussion group not found."}
+            await message.answer(err.get(lang, err["uz"]))
+            return
+        try:
+            await bot.send_video_note(
+                discussion_id,
+                video_note=vn.file_id,
+                reply_to_message_id=ch_msg_id
+            )
+            ok = {"uz": "✅ Anonim kommentingiz yuborildi!", "ru": "✅ Ваш анонимный комментарий отправлен!", "en": "✅ Your anonymous comment has been sent!"}
+            await message.answer(ok.get(lang, ok["uz"]))
+        except Exception as e:
+            logger.warning(f"Anon video_note reply error: {e}")
+            await message.answer(f"⚠️ {e}")
+        return
+
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db = await get_db()
     inserted_id = None
@@ -1914,6 +2079,33 @@ async def handle_voice(message: types.Message):
     if not await check_channel_subscription(user_id):
         user = await get_user_profile(user_id)
         await send_subscription_prompt(message, user.get("language", "uz"))
+        return
+
+    # --- ANON REPLY SESSION (voice) ---
+    if user_id in anon_reply_sessions:
+        session = anon_reply_sessions.pop(user_id)
+        discussion_id = session.get("discussion_id")
+        ch_msg_id = session.get("channel_msg_id")
+        channel_order_val = session.get("channel_order", ch_msg_id)
+        user = await get_user_profile(user_id)
+        lang = user.get("language", "uz")
+        if not discussion_id:
+            err = {"uz": "⚠️ Kanal discussion guruhi topilmadi.", "ru": "⚠️ Группа обсуждений не найдена.", "en": "⚠️ Discussion group not found."}
+            await message.answer(err.get(lang, err["uz"]))
+            return
+        try:
+            anon_caption = f"💬 Anonim ovozli komment (#{channel_order_val})"
+            await bot.send_voice(
+                discussion_id,
+                voice=voice.file_id,
+                caption=anon_caption,
+                reply_to_message_id=ch_msg_id
+            )
+            ok = {"uz": "✅ Anonim kommentingiz yuborildi!", "ru": "✅ Ваш анонимный комментарий отправлен!", "en": "✅ Your anonymous comment has been sent!"}
+            await message.answer(ok.get(lang, ok["uz"]))
+        except Exception as e:
+            logger.warning(f"Anon voice reply error: {e}")
+            await message.answer(f"⚠️ {e}")
         return
 
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1992,6 +2184,40 @@ async def handle_text(message: types.Message):
             await message.answer(blocked_msg.get(lang, blocked_msg["uz"]))
         except Exception:
             pass
+        return
+
+    # 0. Check if user is in anon reply session
+    if user_id in anon_reply_sessions:
+        session = anon_reply_sessions.pop(user_id)
+        discussion_id = session.get("discussion_id")
+        ch_msg_id = session.get("channel_msg_id")
+        channel_order_val = session.get("channel_order", ch_msg_id)
+        user = await get_user_profile(user_id)
+        lang = user.get("language", "uz")
+
+        if user_text.strip().lower() in ["/cancel", "bekor qilish", "отмена", "cancel"]:
+            msgs = {"uz": "❌ Anonim komment bekor qilindi.", "ru": "❌ Анонимный комментарий отменён.", "en": "❌ Anonymous comment cancelled."}
+            await message.answer(msgs.get(lang, msgs["uz"]))
+            return
+
+        if not discussion_id:
+            err = {"uz": "⚠️ Kanal discussion guruhi topilmadi.", "ru": "⚠️ Группа обсуждений не найдена.", "en": "⚠️ Discussion group not found."}
+            await message.answer(err.get(lang, err["uz"]))
+            return
+
+        try:
+            anon_text = f"💬 <b>Anonim komment</b> (#{channel_order_val})\n\n{user_text}"
+            await bot.send_message(
+                discussion_id,
+                anon_text,
+                reply_to_message_id=ch_msg_id
+            )
+            ok = {"uz": "✅ Anonim kommentingiz yuborildi!", "ru": "✅ Ваш анонимный комментарий отправлен!", "en": "✅ Your anonymous comment has been sent!"}
+            await message.answer(ok.get(lang, ok["uz"]))
+        except Exception as e:
+            logger.warning(f"Anon text reply error: {e}")
+            err2 = {"uz": f"⚠️ Yuborishda xatolik: {e}", "ru": f"⚠️ Ошибка отправки: {e}", "en": f"⚠️ Send error: {e}"}
+            await message.answer(err2.get(lang, err2["uz"]))
         return
 
     # 1. Check if Admin is in active reply mode
