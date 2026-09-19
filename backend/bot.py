@@ -48,6 +48,7 @@ user_published_notif_map: Dict[int, tuple] = {}
 admin_active_reply: Dict[int, Dict[str, Any]] = {}
 admin_broadcast_sessions: Set[int] = set()
 admin_channel_sessions: Set[int] = set()
+admin_channel_order_sessions: Set[int] = set()
 admin_search_user_sessions: Set[int] = set()
 admin_search_history_sessions: Set[int] = set()
 admin_add_admin_sessions: Set[int] = set()
@@ -147,9 +148,10 @@ def get_message_action_markup(db_msg_id: int, user_id: int, is_auto_published: b
         ]
     ])
 
-async def get_next_channel_order() -> int:
+async def get_next_channel_order(db_msg_id: Optional[int] = None) -> int:
     """Calculates next sequential channel post ID.
-    Starts from 15 (or custom setting). Rejected/cancelled posts never consume an ID.
+    Starts from channel_start_order (default 31). Rejected/cancelled posts never consume an ID.
+    If db_msg_id is provided, accounts for earlier unapproved/pending messages in moderation queue.
     """
     db = await get_db()
     try:
@@ -157,15 +159,25 @@ async def get_next_channel_order() -> int:
         row = await cur.fetchone()
         max_order = row[0] if row and row[0] is not None else None
         
-        start_setting = await get_setting("channel_start_order", "15")
+        start_setting = await get_setting("channel_start_order", "31")
         try:
             start_num = int(start_setting)
         except (ValueError, TypeError):
-            start_num = 15
+            start_num = 31
 
-        if max_order is None or max_order < (start_num - 1):
-            return start_num
-        return max_order + 1
+        base_order = start_num if (max_order is None or max_order < start_num) else (max_order + 1)
+
+        if db_msg_id is not None:
+            # Count any older pending messages waiting in moderation queue
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM messages WHERE status = 'new' AND id < ?", 
+                (db_msg_id,)
+            )
+            count_row = await cur.fetchone()
+            pending_count = count_row[0] if count_row else 0
+            return base_order + pending_count
+
+        return base_order
     finally:
         await db.close()
 
@@ -392,7 +404,7 @@ async def notify_admins(
     """Sends immediate Telegram notifications to all ADMIN_IDS following the requested template."""
     next_order = None
     if not is_auto_published:
-        next_order = await get_next_channel_order()
+        next_order = await get_next_channel_order(db_msg_id=db_msg_id)
 
     admin_text = format_admin_notification(
         user_name=user_name,
@@ -636,8 +648,8 @@ async def cb_user_cancel(query: CallbackQuery):
             except Exception:
                 pass
             try:
-                # channel_order bor bo'lsa uni, yo'q bo'lsa db msg_id ni ko'rsat
-                display_num = m_channel_order if m_channel_order else msg_id
+                # channel_order bor bo'lsa uni, yo'q bo'lsa preview channel orderni ko'rsat
+                display_num = m_channel_order or await get_next_channel_order(msg_id)
                 await bot.send_message(
                     a_id, 
                     f"⚠️ <b>#{display_num}-sonli xabar foydalanuvchi tomonidan bekor qilindi (Kanalga chiqarilmaydi / Kanaldan o'chirildi).</b>"
@@ -970,20 +982,24 @@ async def cb_admin_channel(query: CallbackQuery):
     is_auto = (await get_setting("auto_post_channel", "0")) == "1"
     auto_status_str = "ВКЛ ✅ (Darhol kanalga tashlanadi)" if is_auto else "ВЫКЛ ❌ (Moderatsiya - Admin tasdig'i bilan)"
     auto_btn_text = "🔄 Авто-постинг: ВКЛ ✅" if is_auto else "🔄 Авто-постинг: ВЫКЛ ❌ (Moderatsiya)"
+    next_order = await get_next_channel_order()
 
     ch_text = (
         "📢 <b>Настройка канала для публикаций</b>\n\n"
         f"Текущий канал: <b>{channel_str}</b>\n"
-        f"Авто-постинг: <b>{auto_status_str}</b>\n\n"
+        f"Авто-постинг: <b>{auto_status_str}</b>\n"
+        f"Следующий номер поста в канале: <b>#{next_order}</b>\n\n"
         "<i>Чтобы бот публиковал сообщения в канал:</i>\n"
         "1. Добавьте бота @TSUE_AnonBot в администраторы канала с правом публикации сообщений.\n"
         "2. Нажмите кнопку ниже и отправьте юзернейм канала (например: <code>@my_channel</code>).\n"
-        "3. Переключайте режим: <b>ВКЛ</b> — посты сразу публикуются с #ID, <b>ВЫКЛ</b> — только после одобрения админом (Approve)."
+        "3. Переключайте режим: <b>ВКЛ</b> — посты сразу публикуются с #ID, <b>ВЫКЛ</b> — только после одобрения админом (Approve).\n"
+        "4. Вы можете вручную изменить следующий номер поста (ID) кнопкой ниже или командой <code>/set_channel_id 31</code>."
     )
 
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=auto_btn_text, callback_data="admin_toggle_autopost")],
         [InlineKeyboardButton(text="✏️ Указать / Изменить канал", callback_data="admin_set_channel_prompt")],
+        [InlineKeyboardButton(text=f"🔢 Изменить номер поста (#{next_order})", callback_data="admin_set_channel_order_prompt")],
         [InlineKeyboardButton(text="📢 Отправить тестовый пост", callback_data="admin_test_channel")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_menu")]
     ])
@@ -1107,9 +1123,19 @@ async def cb_publish(query: CallbackQuery):
         ])
         try:
             if query.message.text:
-                await query.message.edit_text(query.message.text + success_tag, reply_markup=post_markup)
+                updated_text = query.message.text
+                updated_text = re.sub(r'Новое сообщение #\d+', f'Новое сообщение #{channel_order}', updated_text)
+                updated_text = re.sub(r'\(Kanal ID: #\d+\)', f'(Kanal ID: #{channel_order})', updated_text)
+                updated_text = re.sub(r'⏳\s*<b>Moderatsiya:[^<]*</b>', '', updated_text).strip()
+                updated_text = re.sub(r'⏳\s*Moderatsiya:[^\n]*', '', updated_text).strip()
+                await query.message.edit_text(updated_text + success_tag, reply_markup=post_markup)
             elif query.message.caption:
-                await query.message.edit_caption(caption=query.message.caption + success_tag, reply_markup=post_markup)
+                updated_caption = query.message.caption
+                updated_caption = re.sub(r'Новое сообщение #\d+', f'Новое сообщение #{channel_order}', updated_caption)
+                updated_caption = re.sub(r'\(Kanal ID: #\d+\)', f'(Kanal ID: #{channel_order})', updated_caption)
+                updated_caption = re.sub(r'⏳\s*<b>Moderatsiya:[^<]*</b>', '', updated_caption).strip()
+                updated_caption = re.sub(r'⏳\s*Moderatsiya:[^\n]*', '', updated_caption).strip()
+                await query.message.edit_caption(caption=updated_caption + success_tag, reply_markup=post_markup)
         except Exception:
             pass
         await query.answer(f"✅ Успешно опубликовано в канал (#{channel_order})!")
@@ -1352,6 +1378,7 @@ async def cb_cancel_admin_action(query: CallbackQuery):
     admin_active_reply.pop(admin_id, None)
     admin_broadcast_sessions.discard(admin_id)
     admin_channel_sessions.discard(admin_id)
+    admin_channel_order_sessions.discard(admin_id)
     admin_search_user_sessions.discard(admin_id)
     admin_search_history_sessions.discard(admin_id)
     admin_add_admin_sessions.discard(admin_id)
@@ -1501,6 +1528,24 @@ async def cb_test_channel(query: CallbackQuery):
         await query.answer(f"✅ Тестовый пост отправлен в {channel}!", show_alert=True)
     except Exception as e:
         await query.answer(f"⚠️ Ошибка отправки в {channel}: {e}", show_alert=True)
+
+@dp.callback_query(F.data == "admin_set_channel_order_prompt")
+async def cb_set_channel_order_prompt(query: CallbackQuery):
+    admin_id = query.from_user.id
+    if admin_id not in ADMIN_IDS:
+        return
+
+    admin_channel_order_sessions.add(admin_id)
+    next_order = await get_next_channel_order()
+    cancel_markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_admin_action")]
+    ])
+    await query.message.answer(
+        f"🔢 <b>Следующий номер поста в канале: #{next_order}</b>\n\n"
+        f"Отправьте новое число (например: <code>31</code>), с которого должны продолжаться посты в канале:",
+        reply_markup=cancel_markup
+    )
+    await query.answer()
 
 @dp.callback_query(F.data == "admin_broadcast_prompt")
 async def cb_broadcast_prompt(query: CallbackQuery):
@@ -1733,6 +1778,43 @@ async def cmd_til(message: types.Message):
     result = await process_user_action(user_id, "/til")
     markup = build_reply_keyboard(result.get("keyboard"))
     await message.answer(result["text"], reply_markup=markup)
+
+@dp.message(Command("set_channel_id", "set_channel_order", "set_order", "channel_id"))
+async def cmd_set_channel_id(message: types.Message):
+    user_id = message.from_user.id
+    if user_id not in ADMIN_IDS:
+        return
+    parts = message.text.strip().split()
+    if len(parts) < 2:
+        current_next = await get_next_channel_order()
+        await message.answer(
+            f"ℹ️ <b>Kanal postlari ID raqami</b>\n\n"
+            f"Hozirgi keyingi post ID raqami: <b>#{current_next}</b>\n\n"
+            f"O'zgartirish uchun raqam bilan yuboring:\n"
+            f"Masalan: <code>/set_channel_id 31</code>"
+        )
+        return
+    try:
+        val_clean = parts[1].replace("#", "")
+        order_num = int(val_clean)
+        if order_num <= 0:
+            raise ValueError()
+    except ValueError:
+        await message.answer("⚠️ Iltimos, musbat butun son kiriting (masalan: <code>/set_channel_id 31</code>).")
+        return
+
+    await set_setting("channel_start_order", str(order_num))
+    db = await get_db()
+    try:
+        await db.execute("UPDATE messages SET channel_order = NULL WHERE status != 'published' AND channel_order >= ?", (order_num,))
+        await db.commit()
+    finally:
+        await db.close()
+
+    await message.answer(
+        f"✅ <b>Kanal postlari ID raqami muvaffaqiyatli o'rnatildi: #{order_num}</b>\n\n"
+        f"Keyingi chiqariladigan post kanalga <b>#{order_num}</b> raqami bilan joylanadi."
+    )
 
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
@@ -2271,6 +2353,38 @@ async def handle_text(message: types.Message):
         await message.answer(
             f"✅ <b>Канал успешно привязан:</b> <code>{channel_val}</code>\n\n"
             f"Теперь при нажатии <b>'✅ Опубликовать'</b> сообщения будут публиковаться в этот канал.",
+            reply_markup=get_admin_panel_markup()
+        )
+        return
+
+    # 2b. Check if Admin is setting next channel post order
+    if user_id in admin_channel_order_sessions:
+        admin_channel_order_sessions.discard(user_id)
+        if user_text.strip().lower() in ["/cancel", "отмена", "bekor qilish"]:
+            await message.answer("❌ Номер поста не изменен.")
+            return
+
+        try:
+            val_clean = user_text.strip().replace("#", "")
+            order_num = int(val_clean)
+            if order_num <= 0:
+                raise ValueError()
+        except ValueError:
+            await message.answer("⚠️ Пожалуйста, введите положительное целое число (например: 31):")
+            admin_channel_order_sessions.add(user_id)
+            return
+
+        await set_setting("channel_start_order", str(order_num))
+        db = await get_db()
+        try:
+            await db.execute("UPDATE messages SET channel_order = NULL WHERE status != 'published' AND channel_order >= ?", (order_num,))
+            await db.commit()
+        finally:
+            await db.close()
+
+        await message.answer(
+            f"✅ <b>Следующий номер поста успешно установлен на #{order_num}!</b>\n\n"
+            f"Теперь следующий одобренный пост выйдет с номером <b>#{order_num}</b>.",
             reply_markup=get_admin_panel_markup()
         )
         return

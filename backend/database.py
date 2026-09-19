@@ -189,8 +189,14 @@ async def init_db():
 
         # Default auto_post_channel setting (0 = disabled / requires admin approve, 1 = direct auto-post)
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('auto_post_channel', '0')")
-        # Default starting post ID for channel (#15)
-        await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('channel_start_order', '15')")
+        # Default starting post ID for channel (#31)
+        await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('channel_start_order', '31')")
+        # Upgrade any existing setting that was below 31 to 31
+        await db.execute("""
+        UPDATE settings 
+        SET value = '31' 
+        WHERE key = 'channel_start_order' AND CAST(value AS INTEGER) < 31
+        """)
 
         await db.commit()
 
