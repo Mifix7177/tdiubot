@@ -148,10 +148,10 @@ def get_message_action_markup(db_msg_id: int, user_id: int, is_auto_published: b
         ]
     ])
 
-async def get_next_channel_order(db_msg_id: Optional[int] = None) -> int:
+async def get_next_channel_order() -> int:
     """Calculates next sequential channel post ID.
     Starts from channel_start_order (default 31). Rejected/cancelled posts never consume an ID.
-    If db_msg_id is provided, accounts for earlier unapproved/pending messages in moderation queue.
+    Counter is strictly sequential based on published posts.
     """
     db = await get_db()
     try:
@@ -165,19 +165,9 @@ async def get_next_channel_order(db_msg_id: Optional[int] = None) -> int:
         except (ValueError, TypeError):
             start_num = 31
 
-        base_order = start_num if (max_order is None or max_order < start_num) else (max_order + 1)
-
-        if db_msg_id is not None:
-            # Count any older pending messages waiting in moderation queue
-            cur = await db.execute(
-                "SELECT COUNT(*) FROM messages WHERE status = 'new' AND id < ?", 
-                (db_msg_id,)
-            )
-            count_row = await cur.fetchone()
-            pending_count = count_row[0] if count_row else 0
-            return base_order + pending_count
-
-        return base_order
+        if max_order is None or max_order < start_num:
+            return start_num
+        return max_order + 1
     finally:
         await db.close()
 
@@ -404,7 +394,7 @@ async def notify_admins(
     """Sends immediate Telegram notifications to all ADMIN_IDS following the requested template."""
     next_order = None
     if not is_auto_published:
-        next_order = await get_next_channel_order(db_msg_id=db_msg_id)
+        next_order = await get_next_channel_order()
 
     admin_text = format_admin_notification(
         user_name=user_name,
@@ -649,7 +639,7 @@ async def cb_user_cancel(query: CallbackQuery):
                 pass
             try:
                 # channel_order bor bo'lsa uni, yo'q bo'lsa preview channel orderni ko'rsat
-                display_num = m_channel_order or await get_next_channel_order(msg_id)
+                display_num = m_channel_order or await get_next_channel_order()
                 await bot.send_message(
                     a_id, 
                     f"⚠️ <b>#{display_num}-sonli xabar foydalanuvchi tomonidan bekor qilindi (Kanalga chiqarilmaydi / Kanaldan o'chirildi).</b>"
