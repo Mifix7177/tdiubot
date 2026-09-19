@@ -265,27 +265,14 @@ async def publish_message_to_channel(db_msg_id: int) -> Tuple[Optional[str], int
     finally:
         await db.close()
 
-    # After publishing: send "Reply anonymously" button to discussion group
+    # After publishing: cache discussion_id if available
     try:
         channel_chat = await bot.get_chat(channel)
         discussion_id = getattr(channel_chat, "linked_chat_id", None)
-        if discussion_id and sent_msg:
-            bot_username = (await bot.get_me()).username
-            deep_link = f"https://t.me/{bot_username}?start=reply_{sent_msg.message_id}"
-            anon_btn_markup = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text="✍️ Reply anonymously",
-                    url=deep_link
-                )]
-            ])
-            await bot.send_message(
-                discussion_id,
-                f"<b>#{channel_order}</b> • Anonim komment yozish uchun tugmani bosing:",
-                reply_to_message_id=sent_msg.message_id,
-                reply_markup=anon_btn_markup
-            )
+        if discussion_id:
+            await set_setting("discussion_chat_id", str(discussion_id))
     except Exception as e:
-        logger.debug(f"Could not send anon reply button to discussion: {e}")
+        logger.debug(f"Could not cache discussion_id: {e}")
 
     return channel_msg_id, channel_order
 
@@ -1705,45 +1692,106 @@ async def cmd_start(message: types.Message):
         await send_subscription_prompt(message, lang)
         return
 
-    # --- DEEP LINK: /start reply_CHANNEL_MSG_ID ---
+    # --- DEEP LINK: /start comment_... or /start reply_... ---
     start_args = message.text.split(maxsplit=1)
-    if len(start_args) > 1 and start_args[1].startswith("reply_"):
-        try:
-            ch_msg_id = int(start_args[1].split("_")[1])
-            # Find channel_order for this message
+    if len(start_args) > 1 and (start_args[1].startswith("comment_") or start_args[1].startswith("reply_")):
+        payload = start_args[1]
+        disc_chat_id = None
+        disc_msg_id = None
+        channel_order_val = None
+
+        if payload.startswith("comment_"):
+            clean_part = payload[len("comment_"):]
+            parts = clean_part.split("_")
+            if len(parts) >= 3:
+                try:
+                    disc_chat_id = int(parts[0])
+                    disc_msg_id = int(parts[1])
+                    channel_order_val = parts[2] if parts[2] != "0" else None
+                except (ValueError, IndexError):
+                    pass
+            elif len(parts) == 2:
+                try:
+                    disc_chat_id = int(parts[0])
+                    disc_msg_id = int(parts[1])
+                except (ValueError, IndexError):
+                    pass
+            elif len(parts) == 1:
+                try:
+                    disc_msg_id = int(parts[0])
+                except ValueError:
+                    pass
+        elif payload.startswith("reply_"):
+            clean_part = payload[len("reply_"):]
+            try:
+                ch_msg_id = int(clean_part)
+                db = await get_db()
+                try:
+                    cur = await db.execute(
+                        "SELECT channel_order, discussion_message_id FROM messages WHERE channel_message_id LIKE ? ORDER BY id DESC LIMIT 1",
+                        (f"%{ch_msg_id}%",)
+                    )
+                    row = await cur.fetchone()
+                    if row:
+                        channel_order_val = row[0]
+                        disc_msg_id = row[1]
+                finally:
+                    await db.close()
+            except Exception as e:
+                logger.warning(f"Error resolving reply_ link: {e}")
+
+        # Fallback for disc_chat_id from setting or linked_chat_id
+        if not disc_chat_id:
+            saved_disc = await get_setting("discussion_chat_id")
+            if saved_disc:
+                try:
+                    disc_chat_id = int(saved_disc)
+                except ValueError:
+                    pass
+            if not disc_chat_id:
+                try:
+                    channel = await get_setting("channel_username") or "@TSUE_Anon"
+                    channel_chat = await bot.get_chat(channel)
+                    disc_chat_id = getattr(channel_chat, "linked_chat_id", None)
+                    if disc_chat_id:
+                        await set_setting("discussion_chat_id", str(disc_chat_id))
+                except Exception:
+                    pass
+
+        # If channel_order_val is not set yet, check DB by discussion_message_id
+        if not channel_order_val and disc_msg_id:
             db = await get_db()
             try:
-                channel = await get_setting("channel_username") or "@TSUE_Anon"
-                channel_chat = await bot.get_chat(channel)
-                discussion_id = getattr(channel_chat, "linked_chat_id", None)
                 cur = await db.execute(
-                    "SELECT channel_order FROM messages WHERE channel_message_id LIKE ?",
-                    (f"%{ch_msg_id}%",)
+                    "SELECT channel_order FROM messages WHERE discussion_message_id = ? ORDER BY id DESC LIMIT 1",
+                    (disc_msg_id,)
                 )
                 row = await cur.fetchone()
+                if row and row[0]:
+                    channel_order_val = row[0]
+            except Exception:
+                pass
             finally:
                 await db.close()
 
-            channel_order_val = row[0] if row else ch_msg_id
-
+        if disc_chat_id and disc_msg_id:
+            order_label = f"#{channel_order_val}" if channel_order_val else "post"
             anon_reply_sessions[user_id] = {
-                "channel_msg_id": ch_msg_id,
-                "channel_order": channel_order_val,
-                "discussion_id": discussion_id
+                "discussion_id": disc_chat_id,
+                "discussion_msg_id": disc_msg_id,
+                "channel_order": channel_order_val or ""
             }
 
             cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_anon_reply")]
             ])
             prompts = {
-                "uz": f"✍️ <b>Post #{channel_order_val}</b> ga anonim komment yozing:\n\n<i>(Matn, rasm, ovoz yoki video yuborishingiz mumkin)</i>",
-                "ru": f"✍️ <b>Напишите анонимный комментарий к посту #{channel_order_val}:</b>\n\n<i>(Можно отправить текст, фото, голос или видео)</i>",
-                "en": f"✍️ <b>Write an anonymous comment for post #{channel_order_val}:</b>\n\n<i>(You can send text, photo, voice or video)</i>"
+                "uz": f"✍️ <b>{order_label}</b> ga anonim komment yozing:\n\n<i>(Matn, rasm, ovoz yoki video yuborishingiz mumkin)</i>",
+                "ru": f"✍️ <b>Напишите анонимный комментарий к {order_label}:</b>\n\n<i>(Можно отправить текст, фото, голос или видео)</i>",
+                "en": f"✍️ <b>Write an anonymous comment for {order_label}:</b>\n\n<i>(You can send text, photo, voice or video)</i>"
             }
             await message.answer(prompts.get(lang, prompts["uz"]), reply_markup=cancel_kb)
             return
-        except Exception as e:
-            logger.warning(f"Deep link anon reply parse error: {e}")
 
     result = await process_user_action(user_id, "/start")
     markup = build_reply_keyboard(result.get("keyboard"))
@@ -1806,8 +1854,109 @@ async def cmd_set_channel_id(message: types.Message):
         f"Keyingi chiqariladigan post kanalga <b>#{order_num}</b> raqami bilan joylanadi."
     )
 
+# ====================================================
+# 💬 DISCUSSION GROUP AUTOMATIC FORWARD & COMMENT HANDLERS
+# ====================================================
+
+@dp.message(F.is_automatic_forward)
+async def handle_discussion_forward(message: types.Message):
+    """Triggered when a post from the linked channel is automatically forwarded into the discussion group by Telegram."""
+    disc_chat_id = message.chat.id
+    disc_msg_id = message.message_id
+    ch_post_id = message.forward_from_message_id
+
+    # Cache discussion group chat ID
+    await set_setting("discussion_chat_id", str(disc_chat_id))
+
+    # Match channel_order and record discussion_message_id in DB
+    channel_order = None
+    db = await get_db()
+    try:
+        if ch_post_id:
+            cur = await db.execute(
+                "SELECT id, channel_order FROM messages WHERE channel_message_id LIKE ? ORDER BY id DESC LIMIT 1",
+                (f"%{ch_post_id}%",)
+            )
+            row = await cur.fetchone()
+            if row:
+                db_id, channel_order = row[0], row[1]
+                await db.execute(
+                    "UPDATE messages SET discussion_message_id = ? WHERE id = ?",
+                    (disc_msg_id, db_id)
+                )
+                await db.commit()
+    finally:
+        await db.close()
+
+    try:
+        bot_info = await bot.get_me()
+        order_tag = f"<b>#{channel_order}</b> • " if channel_order else ""
+        deep_link = f"https://t.me/{bot_info.username}?start=comment_{disc_chat_id}_{disc_msg_id}_{channel_order or 0}"
+
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="✍️ Reply anonymously",
+                url=deep_link
+            )]
+        ])
+
+        await message.reply(
+            f"{order_tag}Anonim komment yozish uchun tugmani bosing:",
+            reply_markup=markup
+        )
+        logger.info(f"Posted 'Reply anonymously' in discussion {disc_chat_id} for forward {disc_msg_id}")
+    except Exception as e:
+        logger.error(f"Error posting anon reply in discussion: {e}")
+
+@dp.message(Command("comment_btn", "anon_btn", "reply_btn"))
+async def cmd_manual_comment_btn(message: types.Message):
+    """Can be used in the discussion group by replying to any post to attach the 'Reply anonymously' button."""
+    if not message.reply_to_message:
+        await message.reply("Ushbu buyruqni kanal postiga reply (javob) qilib yozing!")
+        return
+
+    target = message.reply_to_message
+    disc_chat_id = message.chat.id
+    disc_msg_id = target.message_id
+    ch_post_id = target.forward_from_message_id
+
+    await set_setting("discussion_chat_id", str(disc_chat_id))
+
+    channel_order = None
+    if ch_post_id:
+        db = await get_db()
+        try:
+            cur = await db.execute(
+                "SELECT channel_order FROM messages WHERE channel_message_id LIKE ? ORDER BY id DESC LIMIT 1",
+                (f"%{ch_post_id}%",)
+            )
+            row = await cur.fetchone()
+            if row:
+                channel_order = row[0]
+        finally:
+            await db.close()
+
+    bot_info = await bot.get_me()
+    order_tag = f"<b>#{channel_order}</b> • " if channel_order else ""
+    deep_link = f"https://t.me/{bot_info.username}?start=comment_{disc_chat_id}_{disc_msg_id}_{channel_order or 0}"
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="✍️ Reply anonymously",
+            url=deep_link
+        )]
+    ])
+
+    await target.reply(
+        f"{order_tag}Anonim komment yozish uchun tugmani bosing:",
+        reply_markup=markup
+    )
+
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
+    if message.chat.type != "private":
+        return
+
     user_id = message.from_user.id
     first_name = message.from_user.full_name or "Talaba"
     username = message.from_user.username or ""
@@ -1827,21 +1976,31 @@ async def handle_photo(message: types.Message):
     if user_id in anon_reply_sessions:
         session = anon_reply_sessions.pop(user_id)
         discussion_id = session.get("discussion_id")
-        ch_msg_id = session.get("channel_msg_id")
-        channel_order_val = session.get("channel_order", ch_msg_id)
+        target_msg_id = session.get("discussion_msg_id") or session.get("channel_msg_id")
+        channel_order_val = session.get("channel_order", "")
         user = await get_user_profile(user_id)
         lang = user.get("language", "uz")
+
         if not discussion_id:
+            saved_disc = await get_setting("discussion_chat_id")
+            if saved_disc:
+                try:
+                    discussion_id = int(saved_disc)
+                except ValueError:
+                    pass
+
+        if not discussion_id or not target_msg_id:
             err = {"uz": "⚠️ Kanal discussion guruhi topilmadi.", "ru": "⚠️ Группа обсуждений не найдена.", "en": "⚠️ Discussion group not found."}
             await message.answer(err.get(lang, err["uz"]))
             return
         try:
-            anon_caption = f"💬 <b>Anonim komment</b> (#{channel_order_val})\n\n{caption}" if caption else f"💬 <b>Anonim komment</b> (#{channel_order_val})"
+            order_tag = f" (#{channel_order_val})" if channel_order_val else ""
+            anon_caption = f"💬 <b>Anonim komment</b>{order_tag}\n\n{caption}" if caption else f"💬 <b>Anonim komment</b>{order_tag}"
             await bot.send_photo(
                 discussion_id,
                 photo=photo.file_id,
                 caption=anon_caption,
-                reply_to_message_id=ch_msg_id
+                reply_to_message_id=target_msg_id
             )
             ok = {"uz": "✅ Anonim kommentingiz yuborildi!", "ru": "✅ Ваш анонимный комментарий отправлен!", "en": "✅ Your anonymous comment has been sent!"}
             await message.answer(ok.get(lang, ok["uz"]))
@@ -1938,6 +2097,9 @@ async def handle_photo(message: types.Message):
 
 @dp.message(F.video)
 async def handle_video(message: types.Message):
+    if message.chat.type != "private":
+        return
+
     user_id = message.from_user.id
     first_name = message.from_user.full_name or "Talaba"
     username = message.from_user.username or ""
@@ -1957,27 +2119,38 @@ async def handle_video(message: types.Message):
     if user_id in anon_reply_sessions:
         session = anon_reply_sessions.pop(user_id)
         discussion_id = session.get("discussion_id")
-        ch_msg_id = session.get("channel_msg_id")
-        channel_order_val = session.get("channel_order", ch_msg_id)
+        target_msg_id = session.get("discussion_msg_id") or session.get("channel_msg_id")
+        channel_order_val = session.get("channel_order", "")
         user = await get_user_profile(user_id)
         lang = user.get("language", "uz")
+
         if not discussion_id:
+            saved_disc = await get_setting("discussion_chat_id")
+            if saved_disc:
+                try:
+                    discussion_id = int(saved_disc)
+                except ValueError:
+                    pass
+
+        if not discussion_id or not target_msg_id:
             err = {"uz": "⚠️ Kanal discussion guruhi topilmadi.", "ru": "⚠️ Группа обсуждений не найдена.", "en": "⚠️ Discussion group not found."}
             await message.answer(err.get(lang, err["uz"]))
             return
         try:
-            anon_caption = f"💬 <b>Anonim komment</b> (#{channel_order_val})"
+            order_tag = f" (#{channel_order_val})" if channel_order_val else ""
+            anon_caption = f"💬 <b>Anonim komment</b>{order_tag}\n\n{caption}" if caption else f"💬 <b>Anonim komment</b>{order_tag}"
             await bot.send_video(
                 discussion_id,
                 video=video.file_id,
                 caption=anon_caption,
-                reply_to_message_id=ch_msg_id
+                reply_to_message_id=target_msg_id
             )
             ok = {"uz": "✅ Anonim kommentingiz yuborildi!", "ru": "✅ Ваш анонимный комментарий отправлен!", "en": "✅ Your anonymous comment has been sent!"}
             await message.answer(ok.get(lang, ok["uz"]))
         except Exception as e:
             logger.warning(f"Anon video reply error: {e}")
-            await message.answer(f"⚠️ {e}")
+            err2 = {"uz": f"⚠️ Yuborishda xatolik: {e}", "ru": f"⚠️ Ошибка отправки: {e}", "en": f"⚠️ Send error: {e}"}
+            await message.answer(err2.get(lang, err2["uz"]))
         return
 
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2040,6 +2213,9 @@ async def handle_video(message: types.Message):
 
 @dp.message(F.video_note)
 async def handle_video_note(message: types.Message):
+    if message.chat.type != "private":
+        return
+
     user_id = message.from_user.id
     first_name = message.from_user.full_name or "Talaba"
     username = message.from_user.username or ""
@@ -2058,11 +2234,20 @@ async def handle_video_note(message: types.Message):
     if user_id in anon_reply_sessions:
         session = anon_reply_sessions.pop(user_id)
         discussion_id = session.get("discussion_id")
-        ch_msg_id = session.get("channel_msg_id")
-        channel_order_val = session.get("channel_order", ch_msg_id)
+        target_msg_id = session.get("discussion_msg_id") or session.get("channel_msg_id")
+        channel_order_val = session.get("channel_order", "")
         user = await get_user_profile(user_id)
         lang = user.get("language", "uz")
+
         if not discussion_id:
+            saved_disc = await get_setting("discussion_chat_id")
+            if saved_disc:
+                try:
+                    discussion_id = int(saved_disc)
+                except ValueError:
+                    pass
+
+        if not discussion_id or not target_msg_id:
             err = {"uz": "⚠️ Kanal discussion guruhi topilmadi.", "ru": "⚠️ Группа обсуждений не найдена.", "en": "⚠️ Discussion group not found."}
             await message.answer(err.get(lang, err["uz"]))
             return
@@ -2070,13 +2255,14 @@ async def handle_video_note(message: types.Message):
             await bot.send_video_note(
                 discussion_id,
                 video_note=vn.file_id,
-                reply_to_message_id=ch_msg_id
+                reply_to_message_id=target_msg_id
             )
             ok = {"uz": "✅ Anonim kommentingiz yuborildi!", "ru": "✅ Ваш анонимный комментарий отправлен!", "en": "✅ Your anonymous comment has been sent!"}
             await message.answer(ok.get(lang, ok["uz"]))
         except Exception as e:
             logger.warning(f"Anon video_note reply error: {e}")
-            await message.answer(f"⚠️ {e}")
+            err2 = {"uz": f"⚠️ Yuborishda xatolik: {e}", "ru": f"⚠️ Ошибка отправки: {e}", "en": f"⚠️ Send error: {e}"}
+            await message.answer(err2.get(lang, err2["uz"]))
         return
 
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2139,6 +2325,9 @@ async def handle_video_note(message: types.Message):
 
 @dp.message(F.voice)
 async def handle_voice(message: types.Message):
+    if message.chat.type != "private":
+        return
+
     user_id = message.from_user.id
     first_name = message.from_user.full_name or "Talaba"
     username = message.from_user.username or ""
@@ -2157,27 +2346,38 @@ async def handle_voice(message: types.Message):
     if user_id in anon_reply_sessions:
         session = anon_reply_sessions.pop(user_id)
         discussion_id = session.get("discussion_id")
-        ch_msg_id = session.get("channel_msg_id")
-        channel_order_val = session.get("channel_order", ch_msg_id)
+        target_msg_id = session.get("discussion_msg_id") or session.get("channel_msg_id")
+        channel_order_val = session.get("channel_order", "")
         user = await get_user_profile(user_id)
         lang = user.get("language", "uz")
+
         if not discussion_id:
+            saved_disc = await get_setting("discussion_chat_id")
+            if saved_disc:
+                try:
+                    discussion_id = int(saved_disc)
+                except ValueError:
+                    pass
+
+        if not discussion_id or not target_msg_id:
             err = {"uz": "⚠️ Kanal discussion guruhi topilmadi.", "ru": "⚠️ Группа обсуждений не найдена.", "en": "⚠️ Discussion group not found."}
             await message.answer(err.get(lang, err["uz"]))
             return
         try:
-            anon_caption = f"💬 Anonim ovozli komment (#{channel_order_val})"
+            order_tag = f" (#{channel_order_val})" if channel_order_val else ""
+            anon_caption = f"💬 <b>Anonim ovozli komment</b>{order_tag}"
             await bot.send_voice(
                 discussion_id,
                 voice=voice.file_id,
                 caption=anon_caption,
-                reply_to_message_id=ch_msg_id
+                reply_to_message_id=target_msg_id
             )
             ok = {"uz": "✅ Anonim kommentingiz yuborildi!", "ru": "✅ Ваш анонимный комментарий отправлен!", "en": "✅ Your anonymous comment has been sent!"}
             await message.answer(ok.get(lang, ok["uz"]))
         except Exception as e:
             logger.warning(f"Anon voice reply error: {e}")
-            await message.answer(f"⚠️ {e}")
+            err2 = {"uz": f"⚠️ Yuborishda xatolik: {e}", "ru": f"⚠️ Ошибка отправки: {e}", "en": f"⚠️ Send error: {e}"}
+            await message.answer(err2.get(lang, err2["uz"]))
         return
 
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2241,6 +2441,9 @@ async def handle_voice(message: types.Message):
 
 @dp.message(F.text)
 async def handle_text(message: types.Message):
+    if message.chat.type != "private":
+        return
+
     user_id = message.from_user.id
     user_text = message.text
 
@@ -2262,8 +2465,8 @@ async def handle_text(message: types.Message):
     if user_id in anon_reply_sessions:
         session = anon_reply_sessions.pop(user_id)
         discussion_id = session.get("discussion_id")
-        ch_msg_id = session.get("channel_msg_id")
-        channel_order_val = session.get("channel_order", ch_msg_id)
+        target_msg_id = session.get("discussion_msg_id") or session.get("channel_msg_id")
+        channel_order_val = session.get("channel_order", "")
         user = await get_user_profile(user_id)
         lang = user.get("language", "uz")
 
@@ -2273,16 +2476,25 @@ async def handle_text(message: types.Message):
             return
 
         if not discussion_id:
+            saved_disc = await get_setting("discussion_chat_id")
+            if saved_disc:
+                try:
+                    discussion_id = int(saved_disc)
+                except ValueError:
+                    pass
+
+        if not discussion_id or not target_msg_id:
             err = {"uz": "⚠️ Kanal discussion guruhi topilmadi.", "ru": "⚠️ Группа обсуждений не найдена.", "en": "⚠️ Discussion group not found."}
             await message.answer(err.get(lang, err["uz"]))
             return
 
         try:
-            anon_text = f"💬 <b>Anonim komment</b> (#{channel_order_val})\n\n{user_text}"
+            order_tag = f" (#{channel_order_val})" if channel_order_val else ""
+            anon_text = f"💬 <b>Anonim komment</b>{order_tag}\n\n{user_text}"
             await bot.send_message(
-                discussion_id,
-                anon_text,
-                reply_to_message_id=ch_msg_id
+                chat_id=discussion_id,
+                text=anon_text,
+                reply_to_message_id=target_msg_id
             )
             ok = {"uz": "✅ Anonim kommentingiz yuborildi!", "ru": "✅ Ваш анонимный комментарий отправлен!", "en": "✅ Your anonymous comment has been sent!"}
             await message.answer(ok.get(lang, ok["uz"]))
@@ -2622,6 +2834,6 @@ async def start_bot_polling():
     """Starts the Telegram bot polling worker."""
     logger.info("Starting Telegram bot polling for @TSUE_AnonBot...")
     try:
-        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query", "channel_post"])
     except Exception as e:
         logger.error(f"Telegram polling exception: {e}")

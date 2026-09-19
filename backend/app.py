@@ -113,7 +113,7 @@ async def reset_webhook():
                 url=webhook_full,
                 secret_token=WEBHOOK_SECRET,
                 drop_pending_updates=False,
-                allowed_updates=["message", "callback_query"]
+                allowed_updates=["message", "callback_query", "channel_post"]
             )
             return {"status": "ok", "message": f"Webhook reset to {webhook_full}"}
         else:
@@ -637,7 +637,7 @@ async def startup_event():
                 url=webhook_full,
                 secret_token=WEBHOOK_SECRET,
                 drop_pending_updates=True,
-                allowed_updates=["message", "callback_query"]
+                allowed_updates=["message", "callback_query", "channel_post"]
             )
             print("✅ Telegram Webhook registered successfully!")
         except Exception as e:

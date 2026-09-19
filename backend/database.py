@@ -98,6 +98,12 @@ async def init_db():
         except Exception:
             pass
 
+        # Migration: discussion_message_id — message ID in the discussion group
+        try:
+            await db.execute("ALTER TABLE messages ADD COLUMN discussion_message_id INTEGER DEFAULT NULL")
+        except Exception:
+            pass
+
 
         # Schedules
         await db.execute("""
@@ -197,6 +203,8 @@ async def init_db():
         SET value = '31' 
         WHERE key = 'channel_start_order' AND CAST(value AS INTEGER) < 31
         """)
+        # Default linked discussion group ID
+        await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('discussion_chat_id', '-1003964941929')")
 
         await db.commit()
 
