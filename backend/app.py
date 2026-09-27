@@ -18,7 +18,8 @@ from backend.config import (
     DATABASE_PATH,
     WEBHOOK_URL, 
     WEBHOOK_PATH, 
-    WEBHOOK_SECRET
+    WEBHOOK_SECRET,
+    KEEP_ALIVE_URL
 )
 from backend.database import get_db, init_db
 from backend.default_data import seed_database
@@ -612,10 +613,33 @@ async def admin_broadcast(data: Dict[str, Any] = Body(...)):
         await db.close()
 
 bot_polling_task = None
+keep_alive_task = None
+
+async def keep_alive_worker():
+    """Periodically pings the service to keep Render container active."""
+    target_url = KEEP_ALIVE_URL or WEBHOOK_URL
+    if not target_url:
+        return
+    
+    health_url = f"{target_url.rstrip('/')}/health"
+    print(f"💓 Keep-alive worker started, targeting {health_url}")
+    await asyncio.sleep(30)  # Wait for startup
+    
+    import httpx
+    while True:
+        try:
+            await asyncio.sleep(9 * 60)  # Ping every 9 minutes (Render sleeps at 15 mins)
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                res = await client.get(health_url)
+                print(f"💓 Keep-alive ping sent: {res.status_code}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"⚠️ Keep-alive ping exception: {e}")
 
 @app.on_event("startup")
 async def startup_event():
-    global bot_polling_task
+    global bot_polling_task, keep_alive_task
     await init_db()
     await seed_database()
     
@@ -629,6 +653,10 @@ async def startup_event():
                 ADMIN_IDS.append(a[0])
     finally:
         await db.close()
+
+    # Start self-ping keep-alive worker
+    keep_alive_task = asyncio.create_task(keep_alive_worker())
+
     if WEBHOOK_URL:
         webhook_full = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
         print(f"🚀 Registering Telegram Webhook: {webhook_full}")
@@ -641,7 +669,12 @@ async def startup_event():
             )
             print("✅ Telegram Webhook registered successfully!")
         except Exception as e:
-            print(f"⚠️ Failed to set webhook on startup: {e}")
+            print(f"⚠️ Failed to set webhook on startup: {e}. Falling back to Bot Polling...")
+            try:
+                await bot.delete_webhook(drop_pending_updates=False)
+            except Exception:
+                pass
+            bot_polling_task = asyncio.create_task(start_bot_polling())
     else:
         print("🚀 WEBHOOK_URL not set: starting Bot Polling in background...")
         try:
@@ -652,7 +685,10 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global bot_polling_task
+    global bot_polling_task, keep_alive_task
+    if keep_alive_task and not keep_alive_task.done():
+        keep_alive_task.cancel()
     if bot_polling_task and not bot_polling_task.done():
         bot_polling_task.cancel()
     await bot.session.close()
+

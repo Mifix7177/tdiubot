@@ -2831,9 +2831,18 @@ async def handle_text(message: types.Message):
     await message.answer(result["text"], reply_markup=markup)
 
 async def start_bot_polling():
-    """Starts the Telegram bot polling worker."""
+    """Starts the Telegram bot polling worker with auto-reconnection on network drops."""
     logger.info("Starting Telegram bot polling for @TSUE_AnonBot...")
-    try:
-        await dp.start_polling(bot, allowed_updates=["message", "callback_query", "channel_post"])
-    except Exception as e:
-        logger.error(f"Telegram polling exception: {e}")
+    retry_delay = 5
+    while True:
+        try:
+            logger.info("Starting dp.start_polling...")
+            await dp.start_polling(bot, allowed_updates=["message", "callback_query", "channel_post"])
+            logger.warning("Polling stopped cleanly.")
+            break
+        except asyncio.CancelledError:
+            logger.info("Telegram polling task cancelled.")
+            break
+        except Exception as e:
+            logger.error(f"Telegram polling exception: {e}. Reconnecting in {retry_delay}s...")
+            await asyncio.sleep(retry_delay)

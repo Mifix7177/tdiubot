@@ -13,9 +13,13 @@ SERVER_HOST = os.getenv("HOST", "0.0.0.0")
 SERVER_PORT = int(os.getenv("PORT", "8000"))
 
 # Webhook Settings for Render.com
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
+_raw_webhook = os.getenv("WEBHOOK_URL", os.getenv("RENDER_EXTERNAL_URL", "")).strip()
+if _raw_webhook and not _raw_webhook.startswith("http://") and not _raw_webhook.startswith("https://"):
+    _raw_webhook = f"https://{_raw_webhook}"
+WEBHOOK_URL = _raw_webhook.rstrip("/")
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "tdiu_render_secret")
+KEEP_ALIVE_URL = os.getenv("KEEP_ALIVE_URL", WEBHOOK_URL).rstrip("/")
 
 # Default Daily Limits
 DEFAULT_GUEST_AI_LIMIT = 5
