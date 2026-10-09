@@ -91,31 +91,26 @@ def format_admin_notification(
     channel_order: Optional[int] = None,
     next_channel_order: Optional[int] = None
 ) -> str:
-    """Notification template for admins."""
+    """Notification template for admins.
+    Appeal ID is strictly db_msg_id. Channel Post ID is channel_order (when published).
+    """
     uname = f"@{username}" if username else "Нет"
     badge = get_type_badge(msg_type)
     
-    display_id = None
-    if channel_order:
-        display_id = channel_order
-    elif next_channel_order:
-        display_id = next_channel_order
-    elif db_msg_id:
-        display_id = db_msg_id
-
-    id_tag = f" <b>#{display_id}</b>" if display_id else ""
-    if is_auto_published:
-        status_line = f"📢 <b>Kanalga avtomatik joylandi (ID: #{display_id}) / Опубликовано в канал!</b>"
-    elif next_channel_order:
-        status_line = f"⏳ <b>Moderatsiya: Kanalga chiqarish uchun quyidagi «✅ Опубликовать (Approve)» tugmasini bosing (Kanal ID: #{display_id}).</b>"
+    appeal_tag = f" <b>#{db_msg_id}</b>" if db_msg_id else ""
+    
+    if is_auto_published and channel_order:
+        status_line = f"📢 <b>Kanalga avtomatik joylandi (Post #{channel_order}) / Опубликовано в канал!</b>"
+    elif channel_order:
+        status_line = f"✅ <b>Kanalga chiqarilgan (Post #{channel_order}) / Опубликовано в канал!</b>"
     else:
         status_line = "⏳ <b>Moderatsiya: Kanalga chiqarish uchun quyidagi «✅ Опубликовать (Approve)» tugmasini bosing.</b>"
 
     return (
-        f"📩 <b>Новое сообщение{id_tag}</b>\n\n"
+        f"📩 <b>Новое обращение{appeal_tag}</b>\n\n"
         f"👤 <b>Имя:</b> {user_name}\n"
         f"🔗 <b>Username:</b> {uname}\n"
-        f"🆔 <b>ID:</b> <code>{user_id}</code>\n\n"
+        f"🆔 <b>User ID:</b> <code>{user_id}</code>\n\n"
         f"📂 <b>Тип:</b> {badge}\n\n"
         f"📝 <b>Сообщение:</b>\n{content}\n\n"
         f"{status_line}"
@@ -148,34 +143,67 @@ def get_message_action_markup(db_msg_id: int, user_id: int, is_auto_published: b
         ]
     ])
 
-async def get_next_channel_order() -> int:
-    """Calculates next sequential channel post ID.
-    Starts from channel_start_order (default 31). Rejected/cancelled posts never consume an ID.
-    Counter is strictly sequential based on published posts.
+async def allocate_next_channel_order() -> int:
+    """Atomically allocates and increments the next sequential channel post ID starting from 34.
+    Guarantees no collisions, no duplicates, and monotonically increasing numbers.
     """
     db = await get_db()
     try:
-        cur = await db.execute("SELECT MAX(channel_order) FROM messages WHERE channel_order IS NOT NULL")
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("SELECT value FROM settings WHERE key = 'channel_start_order'")
         row = await cur.fetchone()
-        max_order = row[0] if row and row[0] is not None else None
-        
-        start_setting = await get_setting("channel_start_order", "31")
         try:
-            start_num = int(start_setting)
+            start_num = int(row[0]) if row and row[0] else 34
         except (ValueError, TypeError):
-            start_num = 31
+            start_num = 34
 
-        if max_order is None or max_order < start_num:
-            return start_num
-        return max_order + 1
+        cur = await db.execute("SELECT MAX(channel_order) FROM messages WHERE channel_order IS NOT NULL")
+        max_row = await cur.fetchone()
+        max_existing = max_row[0] if max_row and max_row[0] is not None else None
+
+        allocated_order = start_num
+        if max_existing is not None and max_existing >= allocated_order:
+            allocated_order = max_existing + 1
+
+        next_start = allocated_order + 1
+        await db.execute("""
+        INSERT INTO settings (key, value) VALUES ('channel_start_order', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """, (str(next_start),))
+        await db.commit()
+        return allocated_order
+    except Exception:
+        await db.rollback()
+        raise
     finally:
         await db.close()
 
+async def get_peek_next_channel_order() -> int:
+    """Preview of next channel post ID without allocating/incrementing."""
+    db = await get_db()
+    try:
+        cur = await db.execute("SELECT value FROM settings WHERE key = 'channel_start_order'")
+        row = await cur.fetchone()
+        try:
+            start_num = int(row[0]) if row and row[0] else 34
+        except (ValueError, TypeError):
+            start_num = 34
+
+        cur = await db.execute("SELECT MAX(channel_order) FROM messages WHERE channel_order IS NOT NULL")
+        max_row = await cur.fetchone()
+        max_existing = max_row[0] if max_row and max_row[0] is not None else None
+
+        if max_existing is not None and max_existing >= start_num:
+            return max_existing + 1
+        return start_num
+    finally:
+        await db.close()
+
+# Alias for backwards compatibility
+get_next_channel_order = get_peek_next_channel_order
+
 async def publish_message_to_channel(db_msg_id: int) -> Tuple[Optional[str], int]:
-    """Publishes a message from DB to the configured channel with #{channel_order} • {category}.
-    channel_order is a sequential counter of published-only messages (starts at #15, reject/cancel gaps are skipped).
-    Returns (channel_message_id, channel_order) on success, raises Exception on failure.
-    """
+    """Publishes a message from DB to configured channel with #{channel_order} • {category}."""
     channel = await get_setting("channel_username") or "@TSUE_Anon"
     channel = channel.strip()
     if not channel.startswith("@") and not channel.startswith("-100"):
@@ -203,8 +231,8 @@ async def publish_message_to_channel(db_msg_id: int) -> Tuple[Optional[str], int
     if m_status == "published" and existing_order:
         return str(existing_ch_id) if existing_ch_id else None, existing_order
 
-    # Compute next sequential channel_order starting from 15 (+1 each)
-    channel_order = existing_order or await get_next_channel_order()
+    # Allocate next sequential channel_order (starts from 34)
+    channel_order = existing_order or await allocate_next_channel_order()
 
     badge = get_type_badge(m_type)
     content_block = f"{m_content}\n\n" if m_content and m_content.strip() else ""
@@ -378,11 +406,6 @@ async def notify_admins(
     is_auto_published: bool = False,
     channel_order: Optional[int] = None
 ):
-    """Sends immediate Telegram notifications to all ADMIN_IDS following the requested template."""
-    next_order = None
-    if not is_auto_published:
-        next_order = await get_next_channel_order()
-
     admin_text = format_admin_notification(
         user_name=user_name,
         username=username,
@@ -391,8 +414,7 @@ async def notify_admins(
         content=content,
         db_msg_id=db_msg_id,
         is_auto_published=is_auto_published,
-        channel_order=channel_order,
-        next_channel_order=next_order
+        channel_order=channel_order
     )
     markup = get_message_action_markup(db_msg_id, user_id, is_auto_published=is_auto_published)
 
@@ -625,11 +647,13 @@ async def cb_user_cancel(query: CallbackQuery):
             except Exception:
                 pass
             try:
-                # channel_order bor bo'lsa uni, yo'q bo'lsa preview channel orderni ko'rsat
-                display_num = m_channel_order or await get_next_channel_order()
+                if m_channel_order:
+                    cancel_info = f"📢 Kanaldagi #{m_channel_order}-sonli post (Murojaat #{msg_id})"
+                else:
+                    cancel_info = f"📩 #{msg_id}-sonli murojaat"
                 await bot.send_message(
                     a_id, 
-                    f"⚠️ <b>#{display_num}-sonli xabar foydalanuvchi tomonidan bekor qilindi (Kanalga chiqarilmaydi / Kanaldan o'chirildi).</b>"
+                    f"⚠️ <b>{cancel_info} foydalanuvchi tomonidan bekor qilindi (Kanalga chiqarilmaydi / Kanaldan o'chirildi).</b>"
                 )
             except Exception:
                 pass
@@ -730,7 +754,7 @@ async def cb_admin_history(query: CallbackQuery):
     db = await get_db()
     try:
         cur = await db.execute("""
-        SELECT id, user_id, user_name, msg_type, content, status, created_at 
+        SELECT id, user_id, user_name, msg_type, content, status, created_at, channel_order 
         FROM messages 
         WHERE status IN ('published', 'rejected', 'replied') 
         ORDER BY id DESC LIMIT 5
@@ -753,10 +777,11 @@ async def cb_admin_history(query: CallbackQuery):
     lines = ["📜 <b>История обработанных сообщений:</b>\n"]
     buttons = []
     for idx, r in enumerate(rows, 1):
-        m_id, u_id, u_name, m_type, m_content, m_st, m_time = r[0], r[1], r[2], r[3], r[4], r[5], r[6]
+        m_id, u_id, u_name, m_type, m_content, m_st, m_time, ch_order = r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]
         st_text = status_labels.get(m_st, m_st)
+        ch_tag = f" (📢 Post <b>#{ch_order}</b>)" if ch_order else ""
         lines.append(
-            f"<b>#{m_id}</b> | <b>{u_name}</b> (ID: <code>{u_id}</code>)\n"
+            f"<b>Murojaat #{m_id}</b>{ch_tag} | <b>{u_name}</b> (ID: <code>{u_id}</code>)\n"
             f"📂 {get_type_badge(m_type)} | {st_text} | 🕒 {m_time}\n"
             f"💬 <i>\"{m_content[:80]}\"</i>\n"
         )
@@ -970,7 +995,7 @@ async def cb_admin_channel(query: CallbackQuery):
         "1. Добавьте бота @TSUE_AnonBot в администраторы канала с правом публикации сообщений.\n"
         "2. Нажмите кнопку ниже и отправьте юзернейм канала (например: <code>@my_channel</code>).\n"
         "3. Переключайте режим: <b>ВКЛ</b> — посты сразу публикуются с #ID, <b>ВЫКЛ</b> — только после одобрения админом (Approve).\n"
-        "4. Вы можете вручную изменить следующий номер поста (ID) кнопкой ниже или командой <code>/set_channel_id 31</code>."
+        "4. Вы можете вручную изменить следующий номер поста (ID) кнопкой ниже или командой <code>/set_channel_id 34</code>."
     )
 
     markup = InlineKeyboardMarkup(inline_keyboard=[
@@ -1092,7 +1117,7 @@ async def cb_publish(query: CallbackQuery):
     try:
         channel_msg_id, channel_order = await publish_message_to_channel(db_msg_id)
         channel = await get_setting("channel_username") or "@TSUE_Anon"
-        success_tag = f"\n\n✅ <b>Опубликовано в канале {channel} (ID: #{channel_order})!</b>"
+        success_tag = f"\n\n✅ <b>Опубликовано в канале {channel} (Post #{channel_order})!</b>"
         post_markup = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="🗑️ Удалить из канала", callback_data=f"delete_channel_post:{db_msg_id}"),
@@ -1101,21 +1126,27 @@ async def cb_publish(query: CallbackQuery):
         try:
             if query.message.text:
                 updated_text = query.message.text
-                updated_text = re.sub(r'Новое сообщение #\d+', f'Новое сообщение #{channel_order}', updated_text)
-                updated_text = re.sub(r'\(Kanal ID: #\d+\)', f'(Kanal ID: #{channel_order})', updated_text)
                 updated_text = re.sub(r'⏳\s*<b>Moderatsiya:[^<]*</b>', '', updated_text).strip()
                 updated_text = re.sub(r'⏳\s*Moderatsiya:[^\n]*', '', updated_text).strip()
                 await query.message.edit_text(updated_text + success_tag, reply_markup=post_markup)
             elif query.message.caption:
                 updated_caption = query.message.caption
-                updated_caption = re.sub(r'Новое сообщение #\d+', f'Новое сообщение #{channel_order}', updated_caption)
-                updated_caption = re.sub(r'\(Kanal ID: #\d+\)', f'(Kanal ID: #{channel_order})', updated_caption)
                 updated_caption = re.sub(r'⏳\s*<b>Moderatsiya:[^<]*</b>', '', updated_caption).strip()
                 updated_caption = re.sub(r'⏳\s*Moderatsiya:[^\n]*', '', updated_caption).strip()
                 await query.message.edit_caption(caption=updated_caption + success_tag, reply_markup=post_markup)
         except Exception:
             pass
-        await query.answer(f"✅ Успешно опубликовано в канал (#{channel_order})!")
+
+        # Disable buttons for other admins to prevent double approval
+        if db_msg_id in admin_msg_tracker:
+            for a_id, a_msg_id in admin_msg_tracker[db_msg_id]:
+                if a_id != admin_id:
+                    try:
+                        await bot.edit_message_reply_markup(chat_id=a_id, message_id=a_msg_id, reply_markup=None)
+                    except Exception:
+                        pass
+
+        await query.answer(f"✅ Успешно опубликовано в канал (Post #{channel_order})!")
     except Exception as e:
         logger.error(f"Failed to publish #{db_msg_id}: {e}")
         await query.answer(f"⚠️ Ошибка публикации: {e}", show_alert=True)
@@ -1666,8 +1697,9 @@ async def cmd_start(message: types.Message):
         ON CONFLICT(telegram_id) DO UPDATE SET 
             username = excluded.username,
             full_name = excluded.full_name,
-            role = excluded.role
-        """, (user_id, username, first_name, role, f"TSUE-{user_id % 10000}"))
+            role = excluded.role,
+            student_id = COALESCE(users.student_id, excluded.student_id)
+        """, (user_id, username, first_name, role, f"TSUE-{user_id}"))
         await db.commit()
     finally:
         await db.close()
@@ -1727,10 +1759,14 @@ async def cmd_start(message: types.Message):
                 ch_msg_id = int(clean_part)
                 db = await get_db()
                 try:
-                    cur = await db.execute(
-                        "SELECT channel_order, discussion_message_id FROM messages WHERE channel_message_id LIKE ? ORDER BY id DESC LIMIT 1",
-                        (f"%{ch_msg_id}%",)
-                    )
+                    cur = await db.execute("""
+                        SELECT channel_order, discussion_message_id FROM messages 
+                        WHERE channel_message_id = ? 
+                           OR channel_message_id LIKE (? || ',%')
+                           OR channel_message_id LIKE ('%,' || ?)
+                           OR channel_message_id LIKE ('%,' || ? || ',%')
+                        ORDER BY id DESC LIMIT 1
+                    """, (str(ch_msg_id), str(ch_msg_id), str(ch_msg_id), str(ch_msg_id)))
                     row = await cur.fetchone()
                     if row:
                         channel_order_val = row[0]
@@ -1829,7 +1865,7 @@ async def cmd_set_channel_id(message: types.Message):
             f"ℹ️ <b>Kanal postlari ID raqami</b>\n\n"
             f"Hozirgi keyingi post ID raqami: <b>#{current_next}</b>\n\n"
             f"O'zgartirish uchun raqam bilan yuboring:\n"
-            f"Masalan: <code>/set_channel_id 31</code>"
+            f"Masalan: <code>/set_channel_id 34</code>"
         )
         return
     try:
@@ -1838,7 +1874,7 @@ async def cmd_set_channel_id(message: types.Message):
         if order_num <= 0:
             raise ValueError()
     except ValueError:
-        await message.answer("⚠️ Iltimos, musbat butun son kiriting (masalan: <code>/set_channel_id 31</code>).")
+        await message.answer("⚠️ Iltimos, musbat butun son kiriting (masalan: <code>/set_channel_id 34</code>).")
         return
 
     await set_setting("channel_start_order", str(order_num))
@@ -1873,18 +1909,25 @@ async def handle_discussion_forward(message: types.Message):
     db = await get_db()
     try:
         if ch_post_id:
-            cur = await db.execute(
-                "SELECT id, channel_order FROM messages WHERE channel_message_id LIKE ? ORDER BY id DESC LIMIT 1",
-                (f"%{ch_post_id}%",)
-            )
+            cur = await db.execute("""
+                SELECT id, channel_order, discussion_message_id FROM messages 
+                WHERE channel_message_id = ? 
+                   OR channel_message_id LIKE (? || ',%')
+                   OR channel_message_id LIKE ('%,' || ?)
+                   OR channel_message_id LIKE ('%,' || ? || ',%')
+                ORDER BY id DESC LIMIT 1
+            """, (str(ch_post_id), str(ch_post_id), str(ch_post_id), str(ch_post_id)))
             row = await cur.fetchone()
             if row:
-                db_id, channel_order = row[0], row[1]
+                db_id, channel_order, existing_disc_id = row[0], row[1], row[2]
                 await db.execute(
                     "UPDATE messages SET discussion_message_id = ? WHERE id = ?",
                     (disc_msg_id, db_id)
                 )
                 await db.commit()
+                # If a button was already posted for this message, don't post duplicate
+                if existing_disc_id:
+                    return
     finally:
         await db.close()
 
@@ -2572,7 +2615,7 @@ async def handle_text(message: types.Message):
             if order_num <= 0:
                 raise ValueError()
         except ValueError:
-            await message.answer("⚠️ Пожалуйста, введите положительное целое число (например: 31):")
+            await message.answer("⚠️ Пожалуйста, введите положительное целое число (например: 34):")
             admin_channel_order_sessions.add(user_id)
             return
 
@@ -2656,14 +2699,26 @@ async def handle_text(message: types.Message):
     if user_id in admin_search_history_sessions:
         admin_search_history_sessions.discard(user_id)
         query_val = user_text.strip()
+        query_clean = query_val.replace("#", "").strip()
+        is_num = query_clean.isdigit()
+        num_val = int(query_clean) if is_num else -1
+
         db = await get_db()
         try:
-            cur = await db.execute("""
-            SELECT id, user_id, user_name, msg_type, content, status, created_at 
-            FROM messages 
-            WHERE content LIKE ? OR user_name LIKE ? OR user_id = ?
-            ORDER BY id DESC LIMIT 5
-            """, (f"%{query_val}%", f"%{query_val}%", query_val))
+            if is_num:
+                cur = await db.execute("""
+                SELECT id, user_id, user_name, msg_type, content, status, created_at, channel_order 
+                FROM messages 
+                WHERE id = ? OR channel_order = ? OR user_id = ? OR content LIKE ? OR user_name LIKE ?
+                ORDER BY id DESC LIMIT 5
+                """, (num_val, num_val, num_val, f"%{query_val}%", f"%{query_val}%"))
+            else:
+                cur = await db.execute("""
+                SELECT id, user_id, user_name, msg_type, content, status, created_at, channel_order 
+                FROM messages 
+                WHERE content LIKE ? OR user_name LIKE ?
+                ORDER BY id DESC LIMIT 5
+                """, (f"%{query_val}%", f"%{query_val}%"))
             found = await cur.fetchall()
         finally:
             await db.close()
@@ -2675,8 +2730,9 @@ async def handle_text(message: types.Message):
         lines = [f"🔎 <b>Найдено в истории ({len(found)} сообщений):</b>\n"]
         buttons = []
         for r in found:
-            m_id, u_id, u_name, m_type, m_content, m_st, m_time = r[0], r[1], r[2], r[3], r[4], r[5], r[6]
-            lines.append(f"<b>#{m_id}</b> | <b>{u_name}</b> (ID: <code>{u_id}</code>)\n📂 {get_type_badge(m_type)} | 🕒 {m_time}\n💬 <i>\"{m_content[:80]}\"</i>\n")
+            m_id, u_id, u_name, m_type, m_content, m_st, m_time, ch_order = r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]
+            ch_tag = f" (📢 Post <b>#{ch_order}</b>)" if ch_order else ""
+            lines.append(f"<b>Murojaat #{m_id}</b>{ch_tag} | <b>{u_name}</b> (ID: <code>{u_id}</code>)\n📂 {get_type_badge(m_type)} | 🕒 {m_time}\n💬 <i>\"{m_content[:80]}\"</i>\n")
             buttons.append([
                 InlineKeyboardButton(text=f"🔄 Повторить #{m_id}", callback_data=f"retry:{m_id}"),
                 InlineKeyboardButton(text=f"🗑️ Удалить #{m_id}", callback_data=f"delete:{m_id}")

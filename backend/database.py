@@ -6,6 +6,7 @@ from backend.config import DATABASE_PATH, ADMIN_IDS
 
 async def get_db():
     db = await aiosqlite.connect(DATABASE_PATH)
+    await db.execute("PRAGMA foreign_keys = ON")
     db.row_factory = aiosqlite.Row
     return db
 
@@ -195,13 +196,19 @@ async def init_db():
 
         # Default auto_post_channel setting (0 = disabled / requires admin approve, 1 = direct auto-post)
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('auto_post_channel', '0')")
-        # Default starting post ID for channel (#31)
-        await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('channel_start_order', '31')")
-        # Upgrade any existing setting that was below 31 to 31
+        # Default starting post ID for channel (#34 as requested by user)
+        await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('channel_start_order', '34')")
+        # Upgrade any existing setting that was below 34 to 34
         await db.execute("""
         UPDATE settings 
-        SET value = '31' 
-        WHERE key = 'channel_start_order' AND CAST(value AS INTEGER) < 31
+        SET value = '34' 
+        WHERE key = 'channel_start_order' AND CAST(value AS INTEGER) < 34
+        """)
+        # Ensure all users have a guaranteed unique student_id
+        await db.execute("""
+        UPDATE users 
+        SET student_id = 'TSUE-' || telegram_id 
+        WHERE student_id IS NULL OR student_id = ''
         """)
         # Default linked discussion group ID
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('discussion_chat_id', '-1003964941929')")

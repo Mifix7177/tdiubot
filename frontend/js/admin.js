@@ -133,8 +133,8 @@ function renderTable() {
     }
 
     const idHtml = m.channel_order 
-      ? `<b style="color:#10b981;">#${m.channel_order}</b> <small style="color:var(--text-muted); font-size:11px;">(ID: ${m.id})</small>`
-      : `<b>#${m.id}</b>`;
+      ? `<b style="color:#10b981;">Post #${m.channel_order}</b><br><small style="color:var(--text-muted); font-size:11px;">Murojaat #${m.id}</small>`
+      : `<b>Murojaat #${m.id}</b>`;
 
     tr.innerHTML = `
       <td>${idHtml}</td>
@@ -209,7 +209,7 @@ async function sendReply() {
 }
 
 async function deleteMessage(msgId) {
-  if (!confirm("Haqiqatan ham ushbu xabarni o'chirmoqchimisiz?")) return;
+  if (!confirm(`Haqiqatan ham #${msgId}-murojaatni o'chirmoqchimisiz?`)) return;
   try {
     await fetch(`${API_BASE}/api/admin/messages/${msgId}`, { method: "DELETE" });
     loadMessages();
@@ -219,12 +219,12 @@ async function deleteMessage(msgId) {
 }
 
 async function publishMessage(id) {
-  if (!confirm(`Haqiqatan ham #${id}-xabarni kanalga chiqarmoqchimisiz (Approve)?`)) return;
+  if (!confirm(`Haqiqatan ham #${id}-murojaatni kanalga chiqarmoqchimisiz (Approve)?`)) return;
   try {
     const res = await fetch(`${API_BASE}/api/admin/messages/${id}/publish`, { method: "POST" });
     const data = await res.json();
     if (res.ok) {
-      alert(`✅ Xabar muvaffaqiyatli kanalga chiqarildi! (Kanal xabar ID: ${data.channel_message_id})`);
+      alert(`✅ Murojaat muvaffaqiyatli kanalga chiqarildi! (Post raqami: #${data.channel_order})`);
       loadMessages();
     } else {
       alert(`Xatolik: ${data.detail || "Chiqarib bo'lmadi"}`);
@@ -235,7 +235,7 @@ async function publishMessage(id) {
 }
 
 async function rejectMessage(id) {
-  if (!confirm(`Haqiqatan ham #${id}-xabarni rad etmoqchimisiz?`)) return;
+  if (!confirm(`Haqiqatan ham #${id}-murojaatni rad etmoqchimisiz?`)) return;
   try {
     const res = await fetch(`${API_BASE}/api/admin/messages/${id}/reject`, { method: "POST" });
     if (res.ok) {

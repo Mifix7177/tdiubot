@@ -27,9 +27,9 @@ async def get_user_profile(user_id: int) -> Dict[str, Any]:
         role = "admin" if user_id in ADMIN_IDS else "student"
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         await db.execute("""
-        INSERT INTO users (telegram_id, username, full_name, role, language, language_selected, created_at)
-        VALUES (?, ?, ?, ?, 'uz', 0, ?)
-        """, (user_id, f"user_{user_id}", f"Foydalanuvchi {user_id}", role, created_at))
+        INSERT INTO users (telegram_id, username, full_name, role, language, language_selected, student_id, created_at)
+        VALUES (?, ?, ?, ?, 'uz', 0, ?, ?)
+        """, (user_id, f"user_{user_id}", f"Foydalanuvchi {user_id}", role, f"TSUE-{user_id}", created_at))
         await db.commit()
         
         cur = await db.execute("SELECT * FROM users WHERE telegram_id = ?", (user_id,))
